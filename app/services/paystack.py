@@ -31,6 +31,19 @@ def _headers() -> dict:
     }
 
 
+def _placeholder_email(phone: str) -> str:
+    """
+    Paystack requires an email even for a WhatsApp-native flow with no
+    customer account. digits-only + a real-shaped public domain — NOT
+    ".local", which is a reserved special-use TLD (RFC 6762, for mDNS) and
+    gets rejected by Paystack's validator as "not a valid email", which is
+    exactly the 400 that broke checkout. Doesn't need to be deliverable,
+    just needs to look like a real domain to pass validation.
+    """
+    digits = "".join(ch for ch in phone if ch.isdigit()) or "guest"
+    return f"wa{digits}@savouryspud-orders.com"
+
+
 @with_retry(max_attempts=3, base_delay=1.5)
 async def initialize_transaction(
     order_id: UUID,
@@ -43,15 +56,10 @@ async def initialize_transaction(
     hence the one and only to_kobo() call in this whole flow. Returns
     {authorization_url, access_code, reference} — authorization_url is what
     gets sent to the customer as their payment link.
-
-    Paystack requires an email even for a WhatsApp-native flow with no
-    customer account — if the customer hasn't given one, pass a
-    deterministic placeholder built from their phone number rather than a
-    fake-looking address, so support/reconciliation can still trace it back.
     """
     reference = f"spud_{order_id}"
     payload = {
-        "email":    customer_email or f"{customer_phone}@whatsapp.savouryspud.local",
+        "email":    customer_email or _placeholder_email(customer_phone),
         "amount":   pricing_engine.to_kobo(amount_naira),
         "currency": settings.currency,
         "reference": reference,

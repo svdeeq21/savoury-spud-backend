@@ -56,6 +56,26 @@ def _format_cart_for_prompt(cart: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_recent_history(messages: list[dict]) -> str:
+    """
+    messages is oldest-first, already capped by the caller (see
+    settings.conversation_history_turns) — this is short-term context for
+    resolving "actually make that two" or "never mind about the cheese",
+    not a searchable transcript. Deliberately small and recent, not the
+    whole conversation, to keep prompts cheap and the model's attention on
+    what's actually relevant right now.
+    """
+    if not messages:
+        return "(no earlier messages)"
+    lines = []
+    for m in messages:
+        speaker = "Customer" if m.get("sender") == "CUSTOMER" else "You"
+        content = (m.get("content") or "").strip()
+        if content:
+            lines.append(f"{speaker}: {content}")
+    return "\n".join(lines) if lines else "(no earlier messages)"
+
+
 _SYSTEM_TEMPLATE = """You are the ordering assistant for {business_name} on WhatsApp. You help customers \
 build an order from the menu below, then hand off to checkout. You are friendly and brief — this is a \
 WhatsApp chat, not an email.
@@ -68,6 +88,10 @@ PICKUP LOCATION: {pickup_address}
 CURRENT CART:
 {cart}
 Fulfillment so far: {fulfillment_status}
+
+RECENT CONVERSATION (oldest first — use this to understand references like "actually make that two" \
+or "never mind about the cheese", and to avoid re-asking something already answered):
+{recent_history}
 
 RULES — follow these exactly, they are not optional:
 1. Only ever reference products/modifiers that appear in the menu above, using their exact names. If \
@@ -124,13 +148,21 @@ def _format_fulfillment_status(cart: dict) -> str:
     return ", ".join(parts)
 
 
-def build_prompt(business_name: str, catalog: list[dict], cart: dict, user_message: str, pickup_address: Optional[str] = None) -> str:
+def build_prompt(
+    business_name: str,
+    catalog: list[dict],
+    cart: dict,
+    user_message: str,
+    pickup_address: Optional[str] = None,
+    recent_messages: Optional[list[dict]] = None,
+) -> str:
     return _SYSTEM_TEMPLATE.format(
         business_name=business_name,
         catalog=_format_catalog_for_prompt(catalog),
         pickup_address=pickup_address or "(not configured)",
         cart=_format_cart_for_prompt(cart),
         fulfillment_status=_format_fulfillment_status(cart),
+        recent_history=_format_recent_history(recent_messages or []),
         user_message=user_message,
     )
 
@@ -157,6 +189,7 @@ async def interpret_customer_message(
     cart: dict,
     user_message: str,
     pickup_address: Optional[str] = None,
+    recent_messages: Optional[list[dict]] = None,
 ) -> dict:
     """
     Returns {"actions": [...], "reply": "..."}. On any parse failure, falls
@@ -164,7 +197,7 @@ async def interpret_customer_message(
     rather than guessing at a cart mutation — a failed parse should never
     silently become a wrong order.
     """
-    prompt = build_prompt(business_name, catalog, cart, user_message, pickup_address)
+    prompt = build_prompt(business_name, catalog, cart, user_message, pickup_address, recent_messages)
 
     try:
         response = _gemini.models.generate_content(model=settings.gemini_model, contents=prompt)

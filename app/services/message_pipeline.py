@@ -72,6 +72,38 @@ async def _claim_message(org_id: UUID, wa_message_id: Optional[str], sender: str
         return False
 
 
+async def _record_bot_message(org_id: UUID, customer_id: UUID, content: str) -> None:
+    """
+    The bot's half of the conversation was never being saved — only inbound
+    customer messages were (via _claim_message). That's the real cause
+    behind "it doesn't remember": the LLM was never shown its own previous
+    replies, only the current cart state, so it had no way to recall a
+    clarifying question it had just asked. No wa_message_id needed here —
+    dedup only matters for inbound webhook redelivery, not outbound sends.
+    """
+    db = await get_supabase()
+    await db.table("conversation_messages").insert({
+        "org_id": str(org_id),
+        "customer_id": str(customer_id),
+        "sender": "BOT",
+        "content": content,
+    }).execute()
+
+
+async def _get_recent_history(customer_id: UUID, limit: int) -> list[dict]:
+    """Last `limit` messages (both sides), returned oldest-first for the prompt."""
+    db = await get_supabase()
+    result = (
+        await db.table("conversation_messages")
+        .select("sender, content")
+        .eq("customer_id", str(customer_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return list(reversed(result.data or []))
+
+
 def _is_admin_number(phone: str) -> bool:
     normalized = normalize_phone(phone)
     return any(normalize_phone(n) == normalized for n in settings.admin_number_list)
@@ -89,11 +121,24 @@ async def handle_incoming_whatsapp_message(phone: str, text: str, wa_message_id:
             await _handle_admin_message(org_id, phone, text)
             return
 
-        customer = await orders.get_or_create_customer(org_id, phone, name=push_name)
+        customer, is_new = await orders.get_or_create_customer(org_id, phone, name=push_name)
         should_process = await _claim_message(org_id, wa_message_id, "CUSTOMER", customer["id"], text)
         if not should_process:
             return
-        await _handle_customer_message(org_id, business_name, pickup_address, customer, phone, text)
+        await _handle_customer_message(org_id, business_name, pickup_address, customer, phone, text, is_new)
+
+
+async def _send_and_record(org_id: UUID, customer_id: UUID, phone: str, text: str) -> None:
+    """Every customer-facing send goes through here so conversation_messages actually has both sides of the chat."""
+    await whatsapp.send_message(phone, text)
+    await _record_bot_message(org_id, customer_id, text)
+
+
+_WELCOME_MESSAGE_TEMPLATE = (
+    "👋 Welcome to {business_name}! I'm here to help you build your box — pick a size, base, protein, "
+    "toppings, sauce, and any extras you'd like, plus a drink if you're after one. Just tell me what you "
+    "want, or ask to see the menu, and I'll take it from there."
+)
 
 
 async def _handle_admin_message(org_id: UUID, phone: str, text: str) -> None:
@@ -102,21 +147,37 @@ async def _handle_admin_message(org_id: UUID, phone: str, text: str) -> None:
     await whatsapp.send_message(phone, reply)
 
 
-async def _handle_customer_message(org_id: UUID, business_name: str, pickup_address: Optional[str], customer: dict, phone: str, text: str) -> None:
+async def _handle_customer_message(
+    org_id: UUID,
+    business_name: str,
+    pickup_address: Optional[str],
+    customer: dict,
+    phone: str,
+    text: str,
+    is_new: bool,
+) -> None:
+    customer_id = customer["id"]
+
+    if is_new:
+        await _send_and_record(org_id, customer_id, phone, _WELCOME_MESSAGE_TEMPLATE.format(business_name=business_name))
+
     now_local = availability.to_business_time(datetime.now(timezone.utc), settings.business_utc_offset_hours)
     availability_row = await availability_store.get_availability_settings(org_id)
     hours_row = await availability_store.get_operating_hours_for_day(org_id, now_local.weekday())
     is_open, closed_reason = availability.resolve_business_open(availability_row, hours_row, now_local)
 
     if not is_open:
-        await whatsapp.send_message(phone, closed_reason)
+        await _send_and_record(org_id, customer_id, phone, closed_reason)
         return
 
-    cart = await orders.get_or_create_open_cart(org_id, customer["id"])
+    cart = await orders.get_or_create_open_cart(org_id, customer_id, stale_after_hours=settings.cart_stale_after_hours)
     catalog_rows = await catalog.get_full_catalog(org_id)
     cart_detail = await orders.get_cart_detail(cart["id"])
+    recent_history = await _get_recent_history(customer_id, settings.conversation_history_turns)
 
-    llm_result = await ordering_llm.interpret_customer_message(business_name, catalog_rows, cart_detail, text, pickup_address)
+    llm_result = await ordering_llm.interpret_customer_message(
+        business_name, catalog_rows, cart_detail, text, pickup_address, recent_history
+    )
 
     checkout_requested = False
     for action in llm_result.get("actions", []):
@@ -130,13 +191,13 @@ async def _handle_customer_message(org_id: UUID, business_name: str, pickup_addr
             # toppings, no delivery address yet, ...) — tell the customer exactly
             # why and stop this turn here rather than applying the rest of a
             # now-inconsistent set of actions.
-            await whatsapp.send_message(phone, str(e))
+            await _send_and_record(org_id, customer_id, phone, str(e))
             return
 
     if checkout_requested:
         await _start_checkout(org_id, cart["id"], customer, phone)
     else:
-        await whatsapp.send_message(phone, llm_result.get("reply", "Got it."))
+        await _send_and_record(org_id, customer_id, phone, llm_result.get("reply", "Got it."))
 
 
 def _find_product_by_name(catalog_rows: list[dict], name: str) -> Optional[dict]:
@@ -228,10 +289,11 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
 
 
 async def _start_checkout(org_id: UUID, cart_id: UUID, customer: dict, phone: str) -> None:
+    customer_id = customer["id"]
     try:
         order = await orders.start_checkout(cart_id)
     except ValueError as e:
-        await whatsapp.send_message(phone, str(e))
+        await _send_and_record(org_id, customer_id, phone, str(e))
         return
 
     # Payment is always for the food subtotal only — delivery fee (if any) is confirmed
@@ -248,13 +310,13 @@ async def _start_checkout(org_id: UUID, cart_id: UUID, customer: dict, phone: st
         await orders.record_pending_payment(order["id"], payment["reference"], amount_to_charge)
     except Exception as e:
         await log.error("CHECKOUT_INIT_FAILED", ref_type="order", ref_id=order["id"], metadata={"error": str(e)[:200]})
-        await whatsapp.send_message(phone, "Sorry, I couldn't start checkout right now — please try again in a moment.")
+        await _send_and_record(org_id, customer_id, phone, "Sorry, I couldn't start checkout right now — please try again in a moment.")
         return
 
     message = f"Your total is ₦{amount_to_charge:,.2f}. Tap here to pay:\n{payment['authorization_url']}"
     if order.get("fulfillment_method") == "DELIVERY":
         message += "\n\n(This covers the food only — we'll confirm your delivery fee separately once payment goes through.)"
-    await whatsapp.send_message(phone, message)
+    await _send_and_record(org_id, customer_id, phone, message)
 
 
 async def handle_confirmed_payment(order_id: UUID, reference: str) -> None:
@@ -275,4 +337,4 @@ async def handle_confirmed_payment(order_id: UUID, reference: str) -> None:
         message += f" {org['name']} will reach out shortly to confirm your delivery fee and arrange delivery."
     elif order.get("fulfillment_method") == "PICKUP":
         message += f" You can pick it up at {org.get('pickup_address') or 'our pickup location'} — we'll let you know when it's ready."
-    await whatsapp.send_message(customer["phone_number"], message)
+    await _send_and_record(order["org_id"], order["customer_id"], customer["phone_number"], message)

@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 from app.services import orders as orders_module
@@ -14,11 +15,13 @@ def patched_db(monkeypatch, fake_db):
 
 async def test_get_or_create_customer_is_idempotent_on_phone(patched_db):
     org_id = uuid4()
-    c1 = await orders_module.get_or_create_customer(org_id, "+234 801-234-5678", name="Ada")
-    c2 = await orders_module.get_or_create_customer(org_id, "2348012345678", name="Someone Else")
+    c1, is_new1 = await orders_module.get_or_create_customer(org_id, "+234 801-234-5678", name="Ada")
+    c2, is_new2 = await orders_module.get_or_create_customer(org_id, "2348012345678", name="Someone Else")
 
     assert c1["id"] == c2["id"]
     assert c2["name"] == "Ada"  # first name wins, not overwritten by a later push_name
+    assert is_new1 is True   # first contact ever from this number
+    assert is_new2 is False  # same number, second contact
 
 
 async def test_get_or_create_open_cart_reuses_existing_cart(patched_db):
@@ -315,3 +318,44 @@ async def test_metrics_separate_food_revenue_from_delivery_fees(patched_db):
     metrics = await orders_module.get_order_metrics(org_id, days=7)
     assert metrics["food_revenue"] == 2500.0
     assert metrics["delivery_fees_recorded"] == 1500.0
+
+
+# ── Cart staleness (returning after a long gap starts fresh, not resuming an old cart) ──
+
+async def test_get_or_create_open_cart_reuses_recent_cart(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart1 = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+    cart2 = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+    assert cart1["id"] == cart2["id"]
+
+
+async def test_get_or_create_open_cart_starts_fresh_after_staleness_window(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    old_cart = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+
+    # Simulate "hasn't touched this cart in 10 hours" by backdating it directly in the fake DB.
+    ten_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+    for row in patched_db.tables["orders"]:
+        if row["id"] == old_cart["id"]:
+            row["updated_at"] = ten_hours_ago
+            row["created_at"] = ten_hours_ago
+
+    new_cart = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+
+    assert new_cart["id"] != old_cart["id"]
+    expired_row = [o for o in patched_db.tables["orders"] if o["id"] == old_cart["id"]][0]
+    assert expired_row["status"] == "EXPIRED"
+
+
+async def test_get_or_create_open_cart_tolerates_a_short_pause(patched_db):
+    """A customer who steps away for 20 minutes mid-order should NOT get a fresh cart."""
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+
+    twenty_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    for row in patched_db.tables["orders"]:
+        if row["id"] == cart["id"]:
+            row["updated_at"] = twenty_min_ago
+
+    same_cart = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
+    assert same_cart["id"] == cart["id"]

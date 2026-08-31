@@ -9,6 +9,29 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Fixes from the first real test run
+
+Live testing on Render surfaced three real issues, all fixed here:
+
+- **Checkout was failing on every order.** Paystack rejected the
+  placeholder email built from `.local` — a reserved special-use TLD
+  (RFC 6762, for mDNS), not a normal domain, so their validator refused it
+  every time. Fixed in `app/services/paystack.py`.
+- **The bot's own replies were never being recorded**, only the
+  customer's — so the ordering LLM had no memory of what it had just said
+  or asked, only the current cart state. Every bot reply now goes through
+  `_send_and_record()` in `message_pipeline.py` and gets written to
+  `conversation_messages`, and the last `CONVERSATION_HISTORY_TURNS`
+  messages (default 8) are now included in the prompt.
+- **An abandoned cart never expired.** A customer returning days later to
+  order something different would have silently resumed whatever was left
+  in their old cart. `orders.get_or_create_open_cart()` now expires a cart
+  that hasn't been touched in `CART_STALE_AFTER_HOURS` (default 4) and
+  starts fresh — long enough to tolerate someone pausing mid-order, short
+  enough to not resurrect a genuinely old one.
+- Also added: a deterministic welcome message on a customer's very first
+  contact ever (not left to the LLM to improvise), rather than silence.
+
 ## What's actually built (phases 1–5 of the plan, now with the real menu)
 
 - **Schema** (`migrations/0001_ordering_schema.sql`) — organizations,
@@ -100,7 +123,7 @@ into Hooze proper only once this has survived contact with real orders.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 52 passed, no external services required
+pytest -q              # 60 passed, no external services required
 uvicorn main:app --reload
 ```
 

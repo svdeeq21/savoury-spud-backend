@@ -26,7 +26,8 @@ def normalize_phone(raw: str) -> str:
     return "".join(ch for ch in raw if ch.isdigit())
 
 
-async def get_or_create_customer(org_id: UUID, phone_number: str, name: Optional[str] = None) -> dict:
+async def get_or_create_customer(org_id: UUID, phone_number: str, name: Optional[str] = None) -> tuple[dict, bool]:
+    """Returns (customer, is_new) — is_new is True only on the very first message this phone number has ever sent."""
     db = await get_supabase()
     phone = normalize_phone(phone_number)
 
@@ -42,22 +43,43 @@ async def get_or_create_customer(org_id: UUID, phone_number: str, name: Optional
         if name and not row.get("name"):
             await db.table("customers").update({"name": name}).eq("id", row["id"]).execute()
             row["name"] = name
-        return row
+        return row, False
 
     inserted = (
         await db.table("customers")
         .insert({"org_id": str(org_id), "phone_number": phone, "name": name})
         .execute()
     )
-    return inserted.data[0]
+    return inserted.data[0], True
 
 
 # ── Cart ────────────────────────────────────────────────────────
 
-async def get_or_create_open_cart(org_id: UUID, customer_id: UUID) -> dict:
+def _is_stale(timestamp_str: Optional[str], stale_after_hours: float) -> bool:
+    if not timestamp_str:
+        return False
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts) > timedelta(hours=stale_after_hours)
+
+
+async def get_or_create_open_cart(org_id: UUID, customer_id: UUID, stale_after_hours: float = 4.0) -> dict:
     """
     Every customer has at most one CART-status order at a time. Returns it,
-    creating one if none exists.
+    creating one if none exists — UNLESS the existing one hasn't been
+    touched in `stale_after_hours`, in which case it's marked EXPIRED and a
+    fresh cart is started instead.
+
+    This is deliberately not a short session timeout (a hard "forget after
+    30 minutes" would punish someone who's just slow mid-order, or steps
+    away and comes back) — it's specifically aimed at the case where
+    someone abandoned an order hours or days ago and comes back later to
+    order something new, and shouldn't have stale, possibly outdated items
+    silently resumed into their new order.
     """
     db = await get_supabase()
 
@@ -71,7 +93,12 @@ async def get_or_create_open_cart(org_id: UUID, customer_id: UUID) -> dict:
         .execute()
     )
     if existing.data:
-        return existing.data[0]
+        cart = existing.data[0]
+        last_touched = cart.get("updated_at") or cart.get("created_at")
+        if not _is_stale(last_touched, stale_after_hours):
+            return cart
+        await db.table("orders").update({"status": "EXPIRED"}).eq("id", cart["id"]).execute()
+        await log.info("STALE_CART_EXPIRED", ref_type="order", ref_id=cart["id"], metadata={"last_touched": last_touched})
 
     inserted = (
         await db.table("orders")
