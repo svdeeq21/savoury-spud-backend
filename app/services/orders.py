@@ -108,6 +108,48 @@ async def get_or_create_open_cart(org_id: UUID, customer_id: UUID, stale_after_h
     return inserted.data[0]
 
 
+def _merge_modifier_selection(product: dict, existing_ids: set, new_modifiers: list[dict]) -> set:
+    """
+    Merges a newly-given batch of modifiers into whatever was already
+    chosen. The rule that actually matches how people order piecemeal:
+    single-select groups (Size, Base, Protein) — a new answer REPLACES the
+    old one, since re-specifying it means changing your mind. Multi-select
+    groups (Toppings, Sauces, Extras) — a new answer ADDS to what's already
+    there, since "Cheese Sauce and Mexican Salsa" said two messages later
+    is completing the topping choice, not replacing an unrelated one.
+    """
+    result = set(existing_ids)
+    groups_by_modifier_id = {
+        m["id"]: group
+        for group in product.get("modifier_groups", [])
+        for m in group.get("modifiers", [])
+    }
+
+    replaced_groups = set()
+    for nm in new_modifiers:
+        group = groups_by_modifier_id.get(nm["id"])
+        if group is None:
+            result.add(nm["id"])
+            continue
+        if group["selection_type"] == "single" and group["id"] not in replaced_groups:
+            group_modifier_ids = {m["id"] for m in group.get("modifiers", [])}
+            result -= group_modifier_ids
+            replaced_groups.add(group["id"])
+        result.add(nm["id"])
+    return result
+
+
+def _missing_required_groups(product: dict, selected_ids: set) -> list[dict]:
+    """Every required group with zero selections so far — used to tell the customer
+    exactly what's still needed, in one message, instead of one field at a time."""
+    missing = []
+    for group in product.get("modifier_groups", []):
+        group_modifier_ids = {m["id"] for m in group.get("modifiers", [])}
+        if group.get("required") and not (selected_ids & group_modifier_ids):
+            missing.append(group)
+    return missing
+
+
 def _validate_modifier_selection(product: dict, modifiers: list[dict]) -> None:
     """
     Enforces each modifier group's required/max_selections against what was
@@ -139,6 +181,56 @@ def _validate_modifier_selection(product: dict, modifiers: list[dict]) -> None:
                 f"\"{group['name']}\" includes up to {max_sel} free, and you picked {count_in_group}. "
                 f"Extra {group['name'].lower()} can be added from Extras for a small fee — want me to add it that way instead?"
             )
+
+
+async def update_draft_item(order_id: UUID, product: dict, quantity: int, new_modifiers: list[dict]) -> dict:
+    """
+    The fix for losing partial answers: merges new_modifiers into whatever
+    draft already exists for this cart, persists it immediately (survives
+    even if this exact call ends up incomplete), and only creates a real
+    order_item once every required group is satisfied.
+
+    Returns one of:
+      {"committed": True, "item": {...}}
+      {"committed": False, "missing": [group, ...], "selected_so_far": [modifier, ...]}
+      {"committed": False, "error": "...", "selected_so_far": [modifier, ...]}   (e.g. too many toppings)
+
+    A different product starting mid-conversation resets the draft rather
+    than mixing modifiers from two different items together — only one
+    item is "in progress" at a time, matching how the flow actually works.
+    """
+    db = await get_supabase()
+    order = (await db.table("orders").select("draft_item").eq("id", str(order_id)).single().execute()).data
+    existing_draft = (order or {}).get("draft_item") or {}
+
+    existing_ids = set(existing_draft.get("modifier_ids", [])) if existing_draft.get("product_id") == product["id"] else set()
+    merged_ids = _merge_modifier_selection(product, existing_ids, new_modifiers)
+
+    all_modifiers_by_id = {m["id"]: m for g in product.get("modifier_groups", []) for m in g.get("modifiers", [])}
+    merged_modifiers = [all_modifiers_by_id[mid] for mid in merged_ids if mid in all_modifiers_by_id]
+
+    async def _persist_draft():
+        await db.table("orders").update({"draft_item": {
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "quantity": quantity,
+            "modifier_ids": list(merged_ids),
+        }}).eq("id", str(order_id)).execute()
+
+    missing = _missing_required_groups(product, merged_ids)
+    if missing:
+        await _persist_draft()
+        return {"committed": False, "missing": missing, "selected_so_far": merged_modifiers}
+
+    try:
+        _validate_modifier_selection(product, merged_modifiers)
+    except ValueError as e:
+        await _persist_draft()
+        return {"committed": False, "error": str(e), "selected_so_far": merged_modifiers}
+
+    item = await add_product(order_id, product, quantity, merged_modifiers)
+    await db.table("orders").update({"draft_item": None}).eq("id", str(order_id)).execute()
+    return {"committed": True, "item": item}
 
 
 async def add_product(

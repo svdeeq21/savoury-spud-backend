@@ -152,6 +152,12 @@ def _build_your_box_product():
              "modifiers": [{"id": "m-cheese", "name": "Cheese Sauce", "price": 0},
                            {"id": "m-corn", "name": "Corn Salad", "price": 0},
                            {"id": "m-salsa", "name": "Mexican Salsa", "price": 0}]},
+            {"id": "g-sauces", "name": "Sauces", "selection_type": "multiple", "required": True, "max_selections": 1,
+             "modifiers": [{"id": "m-garlic", "name": "Garlic Sauce", "price": 0},
+                           {"id": "m-burger", "name": "Burger Sauce", "price": 0},
+                           {"id": "m-bbq", "name": "BBQ Sauce", "price": 0},
+                           {"id": "m-honeymustard", "name": "Hot Honey Mustard", "price": 0},
+                           {"id": "m-yaji", "name": "Yaji Sauce", "price": 0}]},
             {"id": "g-extras", "name": "Extras", "selection_type": "multiple", "required": False, "max_selections": None,
              "modifiers": [{"id": "m-extra-topping", "name": "Extra Toppings", "price": 500}]},
         ],
@@ -196,6 +202,7 @@ async def test_add_product_accepts_a_full_valid_selection(patched_db):
         {"id": "m-chicken", "name": "Crispy Chicken", "price": 0},
         {"id": "m-cheese", "name": "Cheese Sauce", "price": 0},
         {"id": "m-corn", "name": "Corn Salad", "price": 0},
+        {"id": "m-garlic", "name": "Garlic Sauce", "price": 0},
     ]
     item = await orders_module.add_product(cart["id"], product, 1, modifiers)
     assert item is not None
@@ -213,6 +220,7 @@ async def test_add_product_extras_group_is_repeatable(patched_db):
         {"id": "m-regular", "name": "Regular", "price": 9000},
         {"id": "m-chicken", "name": "Crispy Chicken", "price": 0},
         {"id": "m-cheese", "name": "Cheese Sauce", "price": 0},
+        {"id": "m-garlic", "name": "Garlic Sauce", "price": 0},
         {"id": "m-extra-topping", "name": "Extra Toppings", "price": 500},
         {"id": "m-extra-topping", "name": "Extra Toppings", "price": 500},  # a 2nd extra topping
     ]
@@ -359,3 +367,106 @@ async def test_get_or_create_open_cart_tolerates_a_short_pause(patched_db):
 
     same_cart = await orders_module.get_or_create_open_cart(org_id, customer_id, stale_after_hours=4.0)
     assert same_cart["id"] == cart["id"]
+
+
+# ── Draft item accumulation (the fix for losing partial answers turn by turn) ──
+
+async def test_update_draft_item_persists_partial_answer_instead_of_discarding_it(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = _build_your_box_product()
+
+    # Size + Protein given, nothing else yet — should NOT commit, but should be remembered.
+    result = await orders_module.update_draft_item(
+        cart["id"], product, 1,
+        [{"id": "m-regular", "name": "Regular", "price": 9000}, {"id": "m-chicken", "name": "Crispy Chicken", "price": 0}],
+    )
+    assert result["committed"] is False
+    assert {g["name"] for g in result["missing"]} == {"Toppings", "Sauces"}
+    assert {m["name"] for m in result["selected_so_far"]} == {"Regular", "Crispy Chicken"}
+
+    order_row = [o for o in patched_db.tables["orders"] if o["id"] == cart["id"]][0]
+    assert set(order_row["draft_item"]["modifier_ids"]) == {"m-regular", "m-chicken"}
+
+
+async def test_update_draft_item_reproduces_and_fixes_the_live_transcript_bug(patched_db):
+    """
+    The exact sequence from the failing WhatsApp transcript: Base+Protein
+    given, then three more messages that each supply something, none of
+    which should ever lose what came before. Ends fully committed with
+    everything the customer actually asked for.
+    """
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = _build_your_box_product()
+
+    # Turn: "regular" (Size) — via an earlier call, then "Plantain base with shawarma chicken"
+    r1 = await orders_module.update_draft_item(
+        cart["id"], product, 1,
+        [{"id": "m-regular", "name": "Regular", "price": 9000}, {"id": "m-chicken", "name": "Crispy Chicken", "price": 0}],
+    )
+    assert r1["committed"] is False
+
+    # Turn: "BBQ Sauce" (a Sauces answer, not Toppings — must be remembered even though Toppings is still missing)
+    r2 = await orders_module.update_draft_item(
+        cart["id"], product, 1,
+        [{"id": "m-bbq", "name": "BBQ Sauce", "price": 0}],
+    )
+    assert r2["committed"] is False
+    assert {g["name"] for g in r2["missing"]} == {"Toppings"}  # Sauces now satisfied, only Toppings left
+    assert {m["name"] for m in r2["selected_so_far"]} == {"Regular", "Crispy Chicken", "BBQ Sauce"}
+
+    # Turn: "Cheese Sauce and Mexican Salsa" (Toppings) — should now complete and commit everything at once
+    r3 = await orders_module.update_draft_item(
+        cart["id"], product, 1,
+        [{"id": "m-cheese", "name": "Cheese Sauce", "price": 0}, {"id": "m-salsa", "name": "Mexican Salsa", "price": 0}],
+    )
+    assert r3["committed"] is True
+    item_modifier_names = {
+        m["modifier_name"] for m in patched_db.tables["order_item_modifiers"] if m["order_item_id"] == r3["item"]["id"]
+    }
+    assert item_modifier_names == {"Regular", "Crispy Chicken", "BBQ Sauce", "Cheese Sauce", "Mexican Salsa"}
+
+    # Draft is cleared once committed — nothing left dangling for the next item.
+    order_row = [o for o in patched_db.tables["orders"] if o["id"] == cart["id"]][0]
+    assert order_row["draft_item"] is None
+
+
+async def test_update_draft_item_single_select_group_is_replaced_not_accumulated(patched_db):
+    """Changing your mind on Base (single-select) should replace it, not add a second base."""
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = _build_your_box_product()
+
+    await orders_module.update_draft_item(cart["id"], product, 1, [{"id": "m-regular", "name": "Regular", "price": 9000}])
+    result = await orders_module.update_draft_item(cart["id"], product, 1, [{"id": "m-large", "name": "Large", "price": 11000}])
+
+    selected_names = {m["name"] for m in result["selected_so_far"]}
+    assert "Large" in selected_names
+    assert "Regular" not in selected_names  # replaced, not both present
+
+
+async def test_update_draft_item_multi_select_group_accumulates_across_turns(patched_db):
+    """Toppings given across two separate messages should both end up selected, not overwrite each other."""
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = _build_your_box_product()
+
+    await orders_module.update_draft_item(cart["id"], product, 1, [{"id": "m-cheese", "name": "Cheese Sauce", "price": 0}])
+    result = await orders_module.update_draft_item(cart["id"], product, 1, [{"id": "m-corn", "name": "Corn Salad", "price": 0}])
+
+    selected_names = {m["name"] for m in result["selected_so_far"]}
+    assert {"Cheese Sauce", "Corn Salad"} <= selected_names  # both present, neither lost
+
+
+async def test_update_draft_item_starting_a_different_product_resets_the_draft(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    box = _build_your_box_product()
+    drink = {"id": "prod-drink", "name": "Chapman", "base_price": 2500, "modifier_groups": []}
+
+    await orders_module.update_draft_item(cart["id"], box, 1, [{"id": "m-regular", "name": "Regular", "price": 9000}])
+    # Switching to an unrelated product mid-conversation shouldn't drag "Regular" into it.
+    result = await orders_module.update_draft_item(cart["id"], drink, 1, [])
+    assert result["committed"] is True  # Chapman has no required groups at all
+    assert result["item"]["product_name"] == "Chapman"

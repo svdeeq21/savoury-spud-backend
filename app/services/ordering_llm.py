@@ -45,14 +45,27 @@ def _format_catalog_for_prompt(catalog: list[dict]) -> str:
     return "\n".join(lines) if lines else "(menu is currently empty)"
 
 
-def _format_cart_for_prompt(cart: dict) -> str:
-    if not cart.get("items"):
-        return "(cart is empty)"
+def _format_cart_for_prompt(cart: dict, catalog: list[dict]) -> str:
     lines = []
-    for item in cart["items"]:
-        mods = ", ".join(m["modifier_name"] for m in item.get("modifiers", []))
-        lines.append(f"- [{item['id']}] {item['quantity']}x {item['product_name']}" + (f" ({mods})" if mods else ""))
-    lines.append(f"Subtotal: ₦{cart['subtotal']:,.0f}  Delivery: ₦{cart['delivery_fee']:,.0f}  Total: ₦{cart['total']:,.0f}")
+    if cart.get("items"):
+        for item in cart["items"]:
+            mods = ", ".join(m["modifier_name"] for m in item.get("modifiers", []))
+            lines.append(f"- [{item['id']}] {item['quantity']}x {item['product_name']}" + (f" ({mods})" if mods else ""))
+        lines.append(f"Subtotal: ₦{cart['subtotal']:,.0f}  Delivery: ₦{cart['delivery_fee']:,.0f}  Total: ₦{cart['total']:,.0f}")
+    else:
+        lines.append("(no items added yet)")
+
+    draft = cart.get("draft_item")
+    if draft and draft.get("modifier_ids"):
+        all_modifiers_by_id = {
+            m["id"]: m for p in catalog for g in p.get("modifier_groups", []) for m in g.get("modifiers", [])
+        }
+        names = [all_modifiers_by_id[mid]["name"] for mid in draft["modifier_ids"] if mid in all_modifiers_by_id]
+        lines.append(
+            f"IN PROGRESS (not yet added — still missing something required): "
+            f"{draft.get('product_name')} — {', '.join(names) if names else 'nothing chosen yet'}"
+        )
+
     return "\n".join(lines)
 
 
@@ -101,8 +114,12 @@ list), say so — never invent a price or pretend to add it.
 prices are fixed and politely decline.
 3. You never state a total yourself — the actual total is computed by the system and shown to the \
 customer separately. Don't restate numbers from the CURRENT CART section as if you calculated them.
-4. If the customer's request is ambiguous (e.g. they name a product but not a required modifier choice), \
-ask a short clarifying question instead of guessing.
+4. Call add_product as soon as the customer gives ANY part of an item — you do not need to wait until \
+you have every required choice. The system remembers whatever's already been chosen (see "IN PROGRESS" \
+above if something's partway done) and merges each new answer in automatically. If something required is \
+still missing after your call, the system tells the customer exactly what, with the real options — you \
+don't need to track or recite that yourself, and you don't need to re-include earlier answers already shown \
+as IN PROGRESS.
 5. Each modifier group has an included-free amount (e.g. "up to 2 included free" for Toppings). If the \
 customer asks for more than that, don't reject it — offer to add the extra via the Extras group instead \
 (e.g. a 3rd topping becomes one "Extra Toppings" selection) and mention it costs more.
@@ -160,7 +177,7 @@ def build_prompt(
         business_name=business_name,
         catalog=_format_catalog_for_prompt(catalog),
         pickup_address=pickup_address or "(not configured)",
-        cart=_format_cart_for_prompt(cart),
+        cart=_format_cart_for_prompt(cart, catalog),
         fulfillment_status=_format_fulfillment_status(cart),
         recent_history=_format_recent_history(recent_messages or []),
         user_message=user_message,

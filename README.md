@@ -9,6 +9,36 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Fixes from the second real test run
+
+A live transcript showed the real failure mode clearly: a customer
+answering one question at a time ("regular" → "plantain, shawarma
+chicken" → "bbq sauce" → "cheese sauce and mexican salsa") kept hitting
+the same generic `"Toppings" is required` error and, at one point, was
+asked to re-supply size/base/protein it had already given several turns
+earlier.
+
+The root cause: `add_product` was all-or-nothing. If any required
+modifier group was missing, the *entire* attempt was discarded — nothing
+was saved — and the LLM had to reconstruct every prior answer from raw
+chat history on the next turn, which it did not reliably do. This only
+worked once the customer gave up and restated the whole order in one
+message.
+
+**Fixed with a persisted draft item** (`orders.update_draft_item()`,
+`migrations/0004_draft_cart_item.sql`): every partial answer is merged
+into `orders.draft_item` immediately — single-select groups (Size, Base,
+Protein) replace the prior answer, multi-select groups (Toppings, Sauces,
+Extras) accumulate across turns. Nothing is ever thrown away. The item
+only becomes a real `order_item` once every required group is satisfied.
+When something's still missing, the customer gets a deterministic message
+listing **every** remaining group and its **actual options** in one shot
+— generated from the real catalog, not left to the LLM to recall or
+improvise, which fixes the "it never tells me what my options are"
+complaint at the same time. The draft is also now shown directly in the
+LLM's prompt (`IN PROGRESS: ...`), so it doesn't have to infer
+already-chosen options purely from re-reading the conversation transcript.
+
 ## Fixes from the first real test run
 
 Live testing on Render surfaced three real issues, all fixed here:
@@ -123,13 +153,18 @@ Live testing on Render surfaced three real issues, all fixed here:
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 60 passed, no external services required
+pytest -q              # 65 passed, no external services required
 uvicorn main:app --reload
 ```
 
 Run the migrations in order against a fresh Supabase project:
 `0001_ordering_schema.sql` → `0002_fulfillment_and_selection_limits.sql` →
-`0003_seed_savoury_spud_catalog.sql`.
+`0003_seed_savoury_spud_catalog.sql` → `0004_draft_cart_item.sql`.
+
+**Already live?** Only `0004_draft_cart_item.sql` needs to be run against
+the existing database — it's a single additive column
+(`alter table orders add column draft_item jsonb`), safe to run without
+touching anything already in there.
 
 ## What you need to supply before this can take a real order
 

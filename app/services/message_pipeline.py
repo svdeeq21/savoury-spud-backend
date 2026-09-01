@@ -180,22 +180,29 @@ async def _handle_customer_message(
     )
 
     checkout_requested = False
+    override_message = None
     for action in llm_result.get("actions", []):
         if action.get("function") == "checkout":
             checkout_requested = True
             continue
         try:
-            await _apply_action(cart["id"], catalog_rows, action)
+            result = await _apply_action(cart["id"], catalog_rows, action)
+            if result:
+                override_message = result
         except ValueError as e:
-            # A business-rule violation (missing required modifier, too many free
-            # toppings, no delivery address yet, ...) — tell the customer exactly
-            # why and stop this turn here rather than applying the rest of a
-            # now-inconsistent set of actions.
+            # A hard business-rule violation (no delivery address yet, invalid quantity, ...)
+            # — tell the customer exactly why and stop this turn here rather than applying
+            # the rest of a now-inconsistent set of actions.
             await _send_and_record(org_id, customer_id, phone, str(e))
             return
 
     if checkout_requested:
         await _start_checkout(org_id, cart["id"], customer, phone)
+    elif override_message:
+        # An add_product attempt was incomplete — the authoritative "here's what's
+        # still missing" message takes priority over whatever the LLM's own reply said,
+        # since the LLM's reply was written without knowing the commit would fail.
+        await _send_and_record(org_id, customer_id, phone, override_message)
     else:
         await _send_and_record(org_id, customer_id, phone, llm_result.get("reply", "Got it."))
 
@@ -234,12 +241,35 @@ def _safe_uuid(value) -> Optional[UUID]:
         return None
 
 
-async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -> None:
+def _format_incomplete_draft_message(product_name: str, result: dict) -> str:
     """
-    Raises ValueError for anything the customer needs to hear about (missing
-    required modifier, too many free toppings, no delivery address yet — see
-    orders._validate_modifier_selection / set_fulfillment_details). The
-    caller is responsible for catching that and messaging the customer.
+    Turns update_draft_item's structured result into the customer-facing
+    message — always lists every still-missing group AND its actual
+    options in one message, generated from the real catalog, never left to
+    the LLM to remember or improvise (that's what was breaking before).
+    """
+    selected = result.get("selected_so_far", [])
+    selected_names = ", ".join(m["name"] for m in selected) if selected else "nothing yet"
+
+    if "error" in result:
+        return f"Got it — {selected_names} so far for your {product_name}. {result['error']}"
+
+    parts = []
+    for group in result.get("missing", []):
+        options = ", ".join(m["name"] for m in group.get("modifiers", []))
+        parts.append(f"{group['name']} (choose at least 1: {options})")
+    return f"Got it — {selected_names} so far for your {product_name}. Still need: {'; '.join(parts)}."
+
+
+async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -> Optional[str]:
+    """
+    Raises ValueError for hard failures the customer needs to hear about
+    (no delivery address yet, invalid quantity, ...). Returns a non-None
+    string when the action produced an authoritative message that should
+    REPLACE the LLM's own reply for this turn — currently only used for an
+    incomplete add_product, where accuracy matters more than letting the
+    LLM improvise. Returns None otherwise, meaning "the LLM's reply stands
+    as-is".
     """
     fn = action.get("function")
 
@@ -249,10 +279,13 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
             # The LLM was instructed never to invent items, but this is the deterministic
             # backstop if it does anyway — silently drop rather than write garbage to the cart.
             await log.warn("LLM_REFERENCED_UNKNOWN_PRODUCT", metadata={"name": action.get("product_name")})
-            return
+            return None
         modifiers = _resolve_modifiers_by_name(product, action.get("modifier_names", []) or [])
         quantity = max(1, int(action.get("quantity", 1) or 1))
-        await orders.add_product(cart_id, product, quantity, modifiers)  # raises ValueError on bad selection
+        result = await orders.update_draft_item(cart_id, product, quantity, modifiers)
+        if result["committed"]:
+            return None  # fully specified and added — let the LLM's own "added to cart" reply stand
+        return _format_incomplete_draft_message(product["name"], result)
 
     elif fn == "remove_item":
         item_id = _safe_uuid(action.get("order_item_id"))
@@ -286,6 +319,8 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
                 delivery_area=action.get("delivery_area"),
                 delivery_landmark=action.get("delivery_landmark"),
             )  # raises ValueError if DELIVERY without an address
+
+    return None
 
 
 async def _start_checkout(org_id: UUID, cart_id: UUID, customer: dict, phone: str) -> None:
