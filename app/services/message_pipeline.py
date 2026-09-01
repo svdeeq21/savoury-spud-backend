@@ -247,18 +247,29 @@ def _format_incomplete_draft_message(product_name: str, result: dict) -> str:
     message — always lists every still-missing group AND its actual
     options in one message, generated from the real catalog, never left to
     the LLM to remember or improvise (that's what was breaking before).
+
+    Two distinct framings: starting a product from scratch reads like a
+    menu walkthrough (this IS the onboarding moment — first thing shown
+    once someone says "I want a box"), while an in-progress item reads as
+    a status update on top of what's already chosen. Same underlying data,
+    worded for where the customer actually is.
     """
     selected = result.get("selected_so_far", [])
-    selected_names = ", ".join(m["name"] for m in selected) if selected else "nothing yet"
 
     if "error" in result:
+        selected_names = ", ".join(m["name"] for m in selected) if selected else "nothing yet"
         return f"Got it — {selected_names} so far for your {product_name}. {result['error']}"
 
     parts = []
     for group in result.get("missing", []):
         options = ", ".join(m["name"] for m in group.get("modifiers", []))
-        parts.append(f"{group['name']} (choose at least 1: {options})")
-    return f"Got it — {selected_names} so far for your {product_name}. Still need: {'; '.join(parts)}."
+        parts.append(f"{group['name']} — choose at least 1: {options}")
+
+    if not selected:
+        return f"Let's build your {product_name}! Here's what you'll need to choose:\n" + "\n".join(f"- {p}" for p in parts)
+
+    selected_names = ", ".join(m["name"] for m in selected)
+    return f"Got it — {selected_names} so far for your {product_name}. Still need:\n" + "\n".join(f"- {p}" for p in parts)
 
 
 async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -> Optional[str]:

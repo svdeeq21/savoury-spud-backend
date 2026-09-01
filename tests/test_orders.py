@@ -459,6 +459,26 @@ async def test_update_draft_item_multi_select_group_accumulates_across_turns(pat
     assert {"Cheese Sauce", "Corn Salad"} <= selected_names  # both present, neither lost
 
 
+async def test_update_draft_item_with_zero_modifiers_lists_every_required_group(patched_db):
+    """
+    The 'I want to order a box' case with nothing else said yet — calling
+    add_product immediately with an empty modifier list (as the LLM is now
+    instructed to do) should surface every required group and its real
+    options in one shot, not just the first one encountered.
+    """
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = _build_your_box_product()
+
+    result = await orders_module.update_draft_item(cart["id"], product, 1, [])
+
+    assert result["committed"] is False
+    assert result["selected_so_far"] == []
+    assert {g["name"] for g in result["missing"]} == {"Size", "Protein", "Toppings", "Sauces"}
+    # Extras is optional — never shows up as "missing", it's not required
+    assert "Extras" not in {g["name"] for g in result["missing"]}
+
+
 async def test_update_draft_item_starting_a_different_product_resets_the_draft(patched_db):
     org_id, customer_id = uuid4(), uuid4()
     cart = await orders_module.get_or_create_open_cart(org_id, customer_id)

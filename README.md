@@ -9,6 +9,28 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Fixes from a follow-up review
+
+The draft-item fix above guarantees the *content* is correct whenever the
+system tells a customer what's missing — but it only guaranteed that
+message was accurate, not that it appeared immediately. A customer saying
+"I want a box" with zero other details could still get a hand-written LLM
+reply that skipped straight to asking about size without laying out the
+whole picture, since nothing forced the LLM to trigger the deterministic
+path right away.
+
+Closed by making it a hard rule rather than a judgment call: the LLM is
+now instructed to call `add_product` the moment a product is named — even
+with an empty modifier list — rather than trying to describe the choices
+itself. `update_draft_item()` called with nothing selected yet now returns
+every required group at once, and `_format_incomplete_draft_message()`
+frames that first response as a menu walkthrough ("Let's build your Build
+Your Box! Here's what you'll need to choose: ...") rather than the
+slightly odd "Got it — nothing yet..." wording a generic template would
+produce. The LLM's own hand-written reply is explicitly told it won't be
+the one shown to the customer in this case, so it no longer needs to (and
+shouldn't try to) enumerate the menu on its own.
+
 ## Fixes from the second real test run
 
 A live transcript showed the real failure mode clearly: a customer
@@ -153,7 +175,7 @@ Live testing on Render surfaced three real issues, all fixed here:
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 65 passed, no external services required
+pytest -q              # 70 passed, no external services required
 uvicorn main:app --reload
 ```
 
