@@ -9,6 +9,40 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Interactive messages (buttons/lists) — added, not yet wired into ordering
+
+Native WhatsApp buttons and list menus (`app/services/whatsapp.py`:
+`send_buttons()`, `send_list()`) are a real UX upgrade for the single-select
+fields (Size, Base, Protein) — tapping removes the entire class of typos
+and invalid answers the draft-item fix above had to work around. **But
+this is added as a standalone, testable capability, not wired into the
+live ordering flow yet, on purpose.**
+
+Why: Evolution API's button/list support is well-documented — by its own
+GitHub issues, by third-party client libraries, and independently by other
+unofficial WhatsApp providers — as unstable specifically on the Baileys
+(WhatsApp Web) connection, which this instance almost certainly uses. One
+client library's own docs: *"Interactive buttons and list messages are not
+supported on the Baileys connector and are likely to be discontinued...
+fully supported only on the Cloud API connector."* There's a closed
+Evolution API bug where buttons/lists worked in v2.3.6 and broke entirely
+in v2.3.7. Rendering can silently stop working on a WhatsApp app update,
+entirely outside anyone's control.
+
+**Test it first:** text `test buttons` or `test list` from an admin
+WhatsApp number. If it renders as tappable UI, great — that's the signal
+to move to phase 2 (wiring it into the real ordering conversation for
+Size/Base/Protein, keeping free text as the fallback for Toppings/Sauces/
+Extras, which don't map cleanly to WhatsApp's single-select-only native
+UI anyway). If it renders as plain text instead, stay on the free-text
+flow — which the draft-item fix already made considerably more robust —
+until ready to move to the official Meta Cloud API.
+
+On the receive side, `app/routers/webhook.py` already extracts a button/
+list reply's display text and feeds it through the *exact same* pipeline
+as typed text — so even without any further wiring, a tap already works
+today exactly as well as typing the same words would.
+
 ## Fixes from a follow-up review
 
 The draft-item fix above guarantees the *content* is correct whenever the
@@ -175,7 +209,7 @@ Live testing on Render surfaced three real issues, all fixed here:
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 70 passed, no external services required
+pytest -q              # 86 passed, no external services required
 uvicorn main:app --reload
 ```
 

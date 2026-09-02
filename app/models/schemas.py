@@ -199,6 +199,8 @@ class AdminCommand(BaseModel):
         "resume_orders",
         "set_item_availability",
         "status_report",
+        "test_buttons",
+        "test_list",
         "unknown",
     ]
     item_name: Optional[str] = None

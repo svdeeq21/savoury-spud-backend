@@ -61,6 +61,16 @@ def test_parses_item_back_in_stock():
     assert cmd.available is True
 
 
+def test_parses_test_buttons():
+    assert parse_admin_command("test buttons").type == "test_buttons"
+    assert parse_admin_command("test button").type == "test_buttons"
+
+
+def test_parses_test_list():
+    assert parse_admin_command("test list").type == "test_list"
+    assert parse_admin_command("test lists").type == "test_list"
+
+
 def test_unrecognized_text_is_unknown():
     cmd = parse_admin_command("what's the weather like")
     assert cmd.type == "unknown"

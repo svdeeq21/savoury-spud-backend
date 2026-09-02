@@ -14,7 +14,7 @@ from typing import Optional
 from uuid import UUID
 
 from app.models.schemas import AdminCommand
-from app.services import catalog, availability_store
+from app.services import catalog, availability_store, whatsapp
 from app.utils.logger import log
 
 _PAUSE_PATTERNS = [
@@ -33,6 +33,8 @@ _STATUS_PATTERNS = [
     r"^status\b",
     r"^how (are|is) (we|it|things)\b",
 ]
+_TEST_BUTTONS_PATTERNS = [r"^test buttons?\b"]
+_TEST_LIST_PATTERNS = [r"^test lists?\b"]
 # "chicken sold out", "we're out of shrimp", "no more chicken", "shrimp is finished"
 _SOLD_OUT_PATTERNS = [
     r"^(?P<item>.+?)\s+(is\s+)?sold\s*out$",
@@ -74,6 +76,12 @@ def parse_admin_command(raw_text: str) -> AdminCommand:
 
     if _match_any(_STATUS_PATTERNS, lowered):
         return AdminCommand(type="status_report", raw_text=raw_text)
+
+    if _match_any(_TEST_BUTTONS_PATTERNS, lowered):
+        return AdminCommand(type="test_buttons", raw_text=raw_text)
+
+    if _match_any(_TEST_LIST_PATTERNS, lowered):
+        return AdminCommand(type="test_list", raw_text=raw_text)
 
     m = _match_any(_SOLD_OUT_PATTERNS, lowered)
     if m:
@@ -143,8 +151,52 @@ async def apply_admin_command(org_id: UUID, actor_phone: str, command: AdminComm
         state = "available again" if command.available else "marked as sold out"
         return f"{item['name']} is now {state}."
 
+    if command.type == "test_buttons":
+        try:
+            await whatsapp.send_buttons(
+                actor_phone,
+                body_text="This is a test button message — did it render as tappable buttons, or as plain text?",
+                buttons=[
+                    {"id": "test_a", "title": "Option A"},
+                    {"id": "test_b", "title": "Option B"},
+                    {"id": "test_c", "title": "Option C"},
+                ],
+                footer="Savoury Spud — interactive message test",
+            )
+            await _record("test_buttons_sent", {})
+            return "Sent — look above ⬆️ for a button message. If it looks like plain text instead, buttons aren't rendering on this instance."
+        except Exception as e:
+            await log.error("TEST_BUTTONS_FAILED", ref_type="org", ref_id=org_id, metadata={"error": str(e)[:200]})
+            return f"Sending failed outright: {str(e)[:200]}"
+
+    if command.type == "test_list":
+        try:
+            products = await catalog.get_full_catalog(org_id)
+            size_group = next(
+                (g for p in products for g in p.get("modifier_groups", []) if g["name"] == "Size"),
+                None,
+            )
+            rows = (
+                [{"id": m["id"], "title": m["name"], "description": f"₦{m['price']:,.0f}"} for m in size_group["modifiers"]]
+                if size_group else
+                [{"id": "test_1", "title": "Test Option 1"}, {"id": "test_2", "title": "Test Option 2"}]
+            )
+            await whatsapp.send_list(
+                actor_phone,
+                title="Test List",
+                body_text="This is a test list message — did it render as a tappable list, or as plain text?",
+                button_text="View Options",
+                sections=[{"title": "Choose Size", "rows": rows}],
+                footer="Savoury Spud — interactive message test",
+            )
+            await _record("test_list_sent", {})
+            return "Sent — look above ⬆️ for a list message with a 'View Options' button. If it looks like plain text instead, lists aren't rendering on this instance."
+        except Exception as e:
+            await log.error("TEST_LIST_FAILED", ref_type="org", ref_id=org_id, metadata={"error": str(e)[:200]})
+            return f"Sending failed outright: {str(e)[:200]}"
+
     await log.warn("ADMIN_COMMAND_NOT_UNDERSTOOD", ref_type="org", ref_id=org_id, metadata={"text": command.raw_text})
     return (
         "I didn't understand that as a command. Try: \"pause orders\", \"resume\", "
-        "\"chicken sold out\", \"chicken available\", or \"status\"."
+        "\"chicken sold out\", \"chicken available\", \"status\", \"test buttons\", or \"test list\"."
     )

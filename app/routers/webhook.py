@@ -36,11 +36,37 @@ def _extract_phone_and_text(payload: WAWebhookPayload) -> tuple[str, str, bool]:
         return "", "", True  # group chat — not something this bot handles
 
     phone_number = remote_jid.replace("@lid", "").replace("@s.whatsapp.net", "").lstrip("+")
-    message_text = (
-        (wa_data.message.get("conversation") or wa_data.message.get("extendedTextMessage", {}).get("text") or "")
-        if wa_data.message else ""
-    )
+    message_text = _extract_message_text(wa_data.message) if wa_data.message else ""
     return phone_number, message_text, (not phone_number or not message_text)
+
+
+def _extract_message_text(message: dict) -> str:
+    """
+    Plain text first, then interactive reply types. A button/list tap is
+    deliberately reduced to its display text and fed through the exact
+    same pipeline as if the customer had typed it — this is the safe first
+    integration step: interactive messages become a nicer input method,
+    not a second code path that has to be kept correct in parallel with
+    the LLM-driven text flow that's already tested end to end. A row-ID-
+    based fast path (skipping the LLM entirely for a tapped selection) is
+    a worthwhile later optimization, but only once buttons/lists are
+    confirmed to actually render reliably on this instance.
+    """
+    if "conversation" in message:
+        return message["conversation"]
+    if "extendedTextMessage" in message:
+        return message["extendedTextMessage"].get("text", "")
+    if "buttonsResponseMessage" in message:
+        r = message["buttonsResponseMessage"]
+        return r.get("selectedDisplayText") or r.get("selectedButtonId", "")
+    if "listResponseMessage" in message:
+        r = message["listResponseMessage"]
+        title = r.get("title") or (r.get("singleSelectReply") or {}).get("selectedRowId", "")
+        return title
+    if "templateButtonReplyMessage" in message:
+        r = message["templateButtonReplyMessage"]
+        return r.get("selectedDisplayText") or r.get("selectedId", "")
+    return ""
 
 
 @router.post("/whatsapp")
