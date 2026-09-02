@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.security import require_admin_key
 from app.core.config import get_settings
@@ -18,7 +18,7 @@ from app.models.schemas import (
     ProductIn, ProductPatch, ModifierPatch, AvailabilityPatch,
     OperatingHoursPatch, OrderStatusPatch, DeliveryFeeIn,
 )
-from app.services import orders, catalog, availability, availability_store, message_pipeline
+from app.services import orders, catalog, availability, availability_store
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 settings = get_settings()
@@ -56,19 +56,11 @@ async def get_order(order_id: UUID, _: str = Depends(require_admin_key)):
 
 
 @router.patch("/orders/{order_id}/status")
-async def update_order_status(order_id: UUID, patch: OrderStatusPatch, background: BackgroundTasks, _: str = Depends(require_admin_key)):
+async def update_order_status(order_id: UUID, patch: OrderStatusPatch, _: str = Depends(require_admin_key)):
     try:
-        updated = await orders.update_status(order_id, patch.status)
+        return await orders.update_status(order_id, patch.status)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-
-    if patch.status == "COMPLETED":
-        # Fire-and-forget, same pattern as the webhook handlers — the star-rating
-        # prompt is a nice-to-have, never something that should hold up or fail
-        # this status change if WhatsApp/Evolution is briefly unavailable.
-        background.add_task(message_pipeline.send_feedback_prompt, order_id)
-
-    return updated
 
 
 @router.patch("/orders/{order_id}/delivery-fee")
