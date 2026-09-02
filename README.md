@@ -9,6 +9,72 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Native WhatsApp interactive UI (buttons + lists)
+
+Added on top of the existing text-only flow, modelled on a competitor's
+"View Plans" list-message UX: customers now get tappable menus instead of
+having to type everything, without changing anything about how the LLM or
+the cart/order engine work underneath.
+
+- **`app/services/whatsapp.py`** — `send_list()` and `send_buttons()`, on
+  top of Evolution API's `POST /message/sendList` and `POST
+  /message/sendButtons`. Both take a plain-text `body` that's shown
+  alongside the interactive part, and both **fall back to sending that
+  body as an ordinary text message** if the interactive call throws —
+  see the big comment at the top of that file for why this fallback
+  isn't optional. In short: interactive buttons/lists are an official
+  WhatsApp Business Platform (Cloud API) feature that a Baileys-based
+  Evolution instance (a normal linked-device connection, not a
+  Business-API-registered number) is only ever unofficially
+  reproducing — it works, but it's had real regressions between
+  Evolution versions and there are open reports of `sendButtons`
+  returning success while nothing renders on the recipient's phone.
+  **Test this against your actual instance before trusting it for
+  paying customers** — if it turns out to be flaky, everything still
+  works exactly as it did before, just as plain text.
+- **`app/routers/webhook.py`** — parses a tap on a list row or reply
+  button (`listResponseMessage` / `buttonsResponseMessage` /
+  `templateButtonReplyMessage`) and feeds it into the same pipeline a
+  typed message goes through. For ordinary menu/modifier taps, the
+  button's `id` is just the option's own name — a tap arrives
+  indistinguishable from the customer having typed "Loaded Fries" or
+  "Large", so `ordering_llm.py` and `orders.py` needed **zero changes**
+  and all 52 original tests still pass untouched.
+- **`app/services/message_pipeline.py`**:
+  - "menu" (typed or tapped, from a "View Menu" button on the welcome
+    message) sends a native WhatsApp list built from the real catalog,
+    grouped into sections by category.
+  - When a draft item is still missing a **single-select** required
+    group (Size, Base, Protein) — not a multi-select one (Toppings,
+    Sauces, Extras, which can't be represented as one tappable choice) —
+    the next message is buttons (≤3 options) or a list (4–10 options)
+    for that group, instead of plain text. The full "everything still
+    missing" text is preserved as the message body either way, so
+    nothing is lost if only the buttons render.
+- **Post-order feedback** (`migrations/0005_order_feedback.sql`,
+  `orders.save_feedback_rating/save_feedback_issue`,
+  `notifications.notify_poor_feedback`) — the moment a merchant marks an
+  order COMPLETED (`dashboard.py`'s status endpoint), the customer gets a
+  ★★★★★ / ★★★ / ★ buttons prompt. 5 stars invites a Google review
+  (`GOOGLE_REVIEW_URL` in `.env`, optional); anything lower asks what went
+  wrong (a 6-option list: food quality, late delivery, missing item, wrong
+  order, customer service, other) instead of pushing a public review, and
+  alerts the admin number(s) — once as soon as the low rating comes in,
+  once more with the reason if the customer answers.
+
+**Not yet done, and worth knowing about before this is "finished":**
+- No tests were written for any of the above — the existing 70 tests
+  exercise pure logic against a fake Supabase client; the interactive
+  send/parse code is thin I/O glue that's more useful to test against a
+  real Evolution instance than to fake convincingly.
+- Rows/sections in the menu list are capped at WhatsApp's 10-row limit —
+  fine for the current ~8-item menu, but flagged in code for whenever it
+  grows.
+- The "View Menu" button on the welcome message and the interactive
+  prompts don't yet have a way to be turned off per-organization if a
+  future multi-tenant customer's Evolution instance turns out not to
+  support them — right now it's all-or-nothing across the deployment.
+
 ## Fixes from a follow-up review
 
 The draft-item fix above guarantees the *content* is correct whenever the

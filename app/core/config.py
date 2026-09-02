@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # organizations row this deployment answers for.
     org_slug: str = "savoury-spud"
 
+    # Optional: shown to a customer who taps the 5-star feedback option
+    # (see message_pipeline._handle_feedback_rating). Leave blank to just
+    # thank them without a review link — nothing breaks either way.
+    google_review_url: str = ""
+
     # operating_hours.open_time/close_time are stored as plain local-time
     # values with no timezone attached — this is what turns "now" (always
     # fetched in UTC) into the business's local clock time before comparing

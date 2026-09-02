@@ -671,3 +671,58 @@ async def get_order_metrics(org_id: UUID, days: int = 7) -> dict:
             for s in ("PAID", "PREPARING", "READY", "COMPLETED", "CANCELLED", "EXPIRED")
         },
     }
+
+
+# ── Post-order feedback ─────────────────────────────────────────
+# See migrations/0005_order_feedback.sql. Sent once per order (from
+# dashboard.py, the moment a merchant marks it COMPLETED) — save_rating is
+# the one-time-only insert; a repeat tap on an already-rated order is
+# handled by the caller checking has_feedback() first rather than by
+# relying on the unique constraint to silently swallow it.
+
+async def has_feedback(order_id: UUID) -> bool:
+    db = await get_supabase()
+    result = (
+        await db.table("order_feedback")
+        .select("id")
+        .eq("order_id", str(order_id))
+        .execute()
+    )
+    return bool(result.data)
+
+
+async def get_feedback(order_id: UUID) -> Optional[dict]:
+    db = await get_supabase()
+    result = (
+        await db.table("order_feedback")
+        .select("rating, issue_category")
+        .eq("order_id", str(order_id))
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+async def save_feedback_rating(org_id: UUID, order_id: UUID, customer_id: UUID, rating: int) -> dict:
+    """rating is 1, 3, or 5 (matching the ★ / ★★★ / ★★★★★ buttons — see
+    message_pipeline.send_feedback_prompt). issue_category is added later,
+    via save_feedback_issue, only for low ratings."""
+    db = await get_supabase()
+    result = (
+        await db.table("order_feedback")
+        .insert({
+            "org_id": str(org_id),
+            "order_id": str(order_id),
+            "customer_id": str(customer_id),
+            "rating": rating,
+        })
+        .execute()
+    )
+    await log.info("ORDER_FEEDBACK_RATED", ref_type="order", ref_id=order_id, metadata={"rating": rating})
+    return result.data[0]
+
+
+async def save_feedback_issue(order_id: UUID, category: str) -> None:
+    db = await get_supabase()
+    await db.table("order_feedback").update({"issue_category": category}).eq("order_id", str(order_id)).execute()
+    await log.info("ORDER_FEEDBACK_ISSUE_RECORDED", ref_type="order", ref_id=order_id, metadata={"category": category})

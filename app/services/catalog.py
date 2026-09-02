@@ -110,6 +110,22 @@ async def invalidate_catalog_cache(org_id: UUID) -> None:
     await cache_delete(_catalog_cache_key(str(org_id)))
 
 
+async def get_category_names(org_id: UUID) -> dict[str, str]:
+    """category_id -> name, for grouping products into WhatsApp list sections.
+    Kept separate from get_full_catalog rather than joined into it — nothing
+    else needs the name (products are matched by name/id elsewhere), and this
+    keeps that function's cached shape unchanged for existing callers."""
+    db = await get_supabase()
+    result = (
+        await db.table("categories")
+        .select("id, name, sort_order")
+        .eq("org_id", str(org_id))
+        .order("sort_order")
+        .execute()
+    )
+    return {c["id"]: c["name"] for c in (result.data or [])}
+
+
 async def get_product(product_id: UUID) -> Optional[dict]:
     db = await get_supabase()
     result = (

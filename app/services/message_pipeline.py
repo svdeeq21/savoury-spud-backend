@@ -109,7 +109,21 @@ def _is_admin_number(phone: str) -> bool:
     return any(normalize_phone(n) == normalized for n in settings.admin_number_list)
 
 
-async def handle_incoming_whatsapp_message(phone: str, text: str, wa_message_id: Optional[str], push_name: Optional[str] = None) -> None:
+_MENU_TRIGGER_WORDS = ("menu", "view menu", "show menu")
+
+
+def _is_menu_request(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(word in lowered for word in _MENU_TRIGGER_WORDS)
+
+
+async def handle_incoming_whatsapp_message(
+    phone: str,
+    text: str,
+    wa_message_id: Optional[str],
+    push_name: Optional[str] = None,
+    button_id: Optional[str] = None,
+) -> None:
     org = await _get_org_id()
     org_id, business_name, pickup_address = org["id"], org["name"], org.get("pickup_address")
 
@@ -125,7 +139,27 @@ async def handle_incoming_whatsapp_message(phone: str, text: str, wa_message_id:
         should_process = await _claim_message(org_id, wa_message_id, "CUSTOMER", customer["id"], text)
         if not should_process:
             return
-        await _handle_customer_message(org_id, business_name, pickup_address, customer, phone, text, is_new)
+
+        # Structured taps (the ★ rating / issue-category prompts sent by
+        # send_feedback_prompt) are answers to a question the ordering LLM
+        # was never shown and has no cart context for — handle them here,
+        # before anything cart/ordering-related, rather than letting them
+        # fall through and get (mis)interpreted as an order message.
+        if button_id and button_id.startswith("rating:"):
+            await _handle_feedback_rating(org_id, customer, phone, button_id)
+            return
+        if button_id and button_id.startswith("issue:"):
+            await _handle_feedback_issue(org_id, customer, phone, button_id)
+            return
+
+        if is_new:
+            await _send_welcome(org_id, business_name, customer["id"], phone)
+
+        if _is_menu_request(text):
+            await _send_interactive_menu(org_id, customer["id"], phone)
+            return
+
+        await _handle_customer_message(org_id, business_name, pickup_address, customer, phone, text)
 
 
 async def _send_and_record(org_id: UUID, customer_id: UUID, phone: str, text: str) -> None:
@@ -137,7 +171,7 @@ async def _send_and_record(org_id: UUID, customer_id: UUID, phone: str, text: st
 _WELCOME_MESSAGE_TEMPLATE = (
     "👋 Welcome to {business_name}! I'm here to help you build your box — pick a size, base, protein, "
     "toppings, sauce, and any extras you'd like, plus a drink if you're after one. Just tell me what you "
-    "want, or ask to see the menu, and I'll take it from there."
+    "want, or tap below to see the menu, and I'll take it from there."
 )
 
 
@@ -147,6 +181,109 @@ async def _handle_admin_message(org_id: UUID, phone: str, text: str) -> None:
     await whatsapp.send_message(phone, reply)
 
 
+async def _send_welcome(org_id: UUID, business_name: str, customer_id: UUID, phone: str) -> None:
+    body = _WELCOME_MESSAGE_TEMPLATE.format(business_name=business_name)
+    sent_interactive = await whatsapp.send_buttons(
+        phone, business_name, body, [{"type": "reply", "displayText": "View Menu", "id": "View Menu"}],
+    )
+    # send_buttons already sent `body` as plain text itself if the interactive
+    # call failed — either way the customer has the welcome message, so this
+    # only records it once, not twice.
+    await _record_bot_message(org_id, customer_id, body)
+    if not sent_interactive:
+        return
+
+
+def _build_menu_sections(catalog_rows: list[dict], category_names: dict[str, str]) -> list[dict]:
+    """Groups products into WhatsApp list sections by category. WA lists cap out at
+    10 rows total across all sections — if the real menu ever grows past that,
+    this trims to the first 10 rather than sending a request WhatsApp will reject;
+    the full menu remains available by asking about anything not shown."""
+    by_category: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for p in catalog_rows:
+        cat_name = category_names.get(p.get("category_id"), "Menu")
+        if cat_name not in by_category:
+            by_category[cat_name] = []
+            order.append(cat_name)
+        by_category[cat_name].append(p)
+
+    sections = []
+    rows_used = 0
+    for cat_name in order:
+        if rows_used >= 10:
+            break
+        rows = []
+        for p in by_category[cat_name]:
+            if rows_used >= 10:
+                break
+            price_label = f"₦{float(p['base_price']):,.0f}"
+            has_choices = bool(p.get("modifier_groups"))
+            description = f"From {price_label}" if has_choices else price_label
+            rows.append({"title": p["name"], "description": description, "rowId": p["name"]})
+            rows_used += 1
+        if rows:
+            sections.append({"title": cat_name, "rows": rows})
+    return sections
+
+
+def _format_menu_as_text(catalog_rows: list[dict], category_names: dict[str, str]) -> str:
+    """Plain-text fallback / list body — the same catalog, readable without tapping anything."""
+    by_category: dict[str, list[str]] = {}
+    order: list[str] = []
+    for p in catalog_rows:
+        cat_name = category_names.get(p.get("category_id"), "Menu")
+        if cat_name not in by_category:
+            by_category[cat_name] = []
+            order.append(cat_name)
+        price_label = f"₦{float(p['base_price']):,.0f}"
+        prefix = "From " if p.get("modifier_groups") else ""
+        by_category[cat_name].append(f"{p['name']} — {prefix}{price_label}")
+    lines = []
+    for cat_name in order:
+        lines.append(f"*{cat_name}*")
+        lines.extend(by_category[cat_name])
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _send_missing_group_prompt(
+    org_id: UUID, customer_id: UUID, phone: str, product_name: str, body: str, group: dict,
+) -> None:
+    """body is the full _format_incomplete_draft_message text (every remaining group,
+    not just this one) — that stays as the message's visible/fallback text; only the
+    tappable part is scoped to this one group, since WhatsApp buttons/lists are a
+    single choice per message."""
+    modifiers = group["modifiers"]
+    title = f"{product_name} — {group['name']}"
+
+    if len(modifiers) <= 3:
+        buttons = [{"type": "reply", "displayText": m["name"], "id": m["name"]} for m in modifiers]
+        await whatsapp.send_buttons(phone, title, body, buttons)
+    else:
+        rows = []
+        for m in modifiers:
+            row = {"title": m["name"], "rowId": m["name"]}
+            if m.get("price"):
+                row["description"] = f"+₦{float(m['price']):,.0f}"
+            rows.append(row)
+        await whatsapp.send_list(phone, title, body, f"Choose {group['name']}", [{"title": group["name"], "rows": rows}])
+
+    await _record_bot_message(org_id, customer_id, body)
+
+
+async def _send_interactive_menu(org_id: UUID, customer_id: UUID, phone: str) -> None:
+    catalog_rows = await catalog.get_full_catalog(org_id)
+    if not catalog_rows:
+        await _send_and_record(org_id, customer_id, phone, "The menu isn't set up yet — please check back shortly.")
+        return
+    category_names = await catalog.get_category_names(org_id)
+    body = _format_menu_as_text(catalog_rows, category_names)
+    sections = _build_menu_sections(catalog_rows, category_names)
+    await whatsapp.send_list(phone, "Our Menu", body, "View Menu", sections)
+    await _record_bot_message(org_id, customer_id, body)
+
+
 async def _handle_customer_message(
     org_id: UUID,
     business_name: str,
@@ -154,12 +291,8 @@ async def _handle_customer_message(
     customer: dict,
     phone: str,
     text: str,
-    is_new: bool,
 ) -> None:
     customer_id = customer["id"]
-
-    if is_new:
-        await _send_and_record(org_id, customer_id, phone, _WELCOME_MESSAGE_TEMPLATE.format(business_name=business_name))
 
     now_local = availability.to_business_time(datetime.now(timezone.utc), settings.business_utc_offset_hours)
     availability_row = await availability_store.get_availability_settings(org_id)
@@ -181,14 +314,16 @@ async def _handle_customer_message(
 
     checkout_requested = False
     override_message = None
+    override_product_name = None
+    override_group = None
     for action in llm_result.get("actions", []):
         if action.get("function") == "checkout":
             checkout_requested = True
             continue
         try:
-            result = await _apply_action(cart["id"], catalog_rows, action)
-            if result:
-                override_message = result
+            message, product_name, group = await _apply_action(cart["id"], catalog_rows, action)
+            if message:
+                override_message, override_product_name, override_group = message, product_name, group
         except ValueError as e:
             # A hard business-rule violation (no delivery address yet, invalid quantity, ...)
             # — tell the customer exactly why and stop this turn here rather than applying
@@ -198,6 +333,11 @@ async def _handle_customer_message(
 
     if checkout_requested:
         await _start_checkout(org_id, cart["id"], customer, phone)
+    elif override_message and override_group:
+        # An add_product attempt was incomplete, and the very next thing still needed is a
+        # single-select group (Size/Base/Protein, not Toppings/Extras) — worth a tappable
+        # buttons/list prompt rather than just text, same as override_message alone would be.
+        await _send_missing_group_prompt(org_id, customer_id, phone, override_product_name, override_message, override_group)
     elif override_message:
         # An add_product attempt was incomplete — the authoritative "here's what's
         # still missing" message takes priority over whatever the LLM's own reply said,
@@ -272,15 +412,44 @@ def _format_incomplete_draft_message(product_name: str, result: dict) -> str:
     return f"Got it — {selected_names} so far for your {product_name}. Still need:\n" + "\n".join(f"- {p}" for p in parts)
 
 
-async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -> Optional[str]:
+def _first_single_select_missing_group(result: dict) -> Optional[dict]:
+    """
+    The next missing group is worth an interactive buttons/list prompt only
+    if it's single-select (a multi-select group like Toppings/Extras can't
+    be represented as one tappable choice) and has a sane number of options
+    (WA lists cap at 10 rows; past that, or with none at all, plain text is
+    the only sane option anyway).
+    """
+    if "error" in result:
+        return None
+    missing = result.get("missing", [])
+    if not missing:
+        return None
+    group = missing[0]
+    modifiers = group.get("modifiers", [])
+    if group.get("selection_type") != "single" or not modifiers or len(modifiers) > 10:
+        return None
+    return group
+
+
+async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -> tuple[Optional[str], Optional[str], Optional[dict]]:
     """
     Raises ValueError for hard failures the customer needs to hear about
-    (no delivery address yet, invalid quantity, ...). Returns a non-None
-    string when the action produced an authoritative message that should
-    REPLACE the LLM's own reply for this turn — currently only used for an
-    incomplete add_product, where accuracy matters more than letting the
-    LLM improvise. Returns None otherwise, meaning "the LLM's reply stands
-    as-is".
+    (no delivery address yet, invalid quantity, ...). Returns
+    (override_message, product_name, interactive_group):
+
+      override_message  — non-None when the action produced an authoritative
+                           message that should REPLACE the LLM's own reply for
+                           this turn (currently only an incomplete add_product,
+                           where accuracy matters more than letting the LLM
+                           improvise).
+      product_name       — the draft item's product name, only set alongside
+                           override_message (needed to build the interactive
+                           prompt's title).
+      interactive_group  — the next missing modifier group, if it's a good
+                           fit for a tappable buttons/list prompt (see
+                           _first_single_select_missing_group) — None means
+                           override_message should just be sent as plain text.
     """
     fn = action.get("function")
 
@@ -290,13 +459,14 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
             # The LLM was instructed never to invent items, but this is the deterministic
             # backstop if it does anyway — silently drop rather than write garbage to the cart.
             await log.warn("LLM_REFERENCED_UNKNOWN_PRODUCT", metadata={"name": action.get("product_name")})
-            return None
+            return None, None, None
         modifiers = _resolve_modifiers_by_name(product, action.get("modifier_names", []) or [])
         quantity = max(1, int(action.get("quantity", 1) or 1))
         result = await orders.update_draft_item(cart_id, product, quantity, modifiers)
         if result["committed"]:
-            return None  # fully specified and added — let the LLM's own "added to cart" reply stand
-        return _format_incomplete_draft_message(product["name"], result)
+            return None, None, None  # fully specified and added — let the LLM's own "added to cart" reply stand
+        message = _format_incomplete_draft_message(product["name"], result)
+        return message, product["name"], _first_single_select_missing_group(result)
 
     elif fn == "remove_item":
         item_id = _safe_uuid(action.get("order_item_id"))
@@ -331,7 +501,7 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
                 delivery_landmark=action.get("delivery_landmark"),
             )  # raises ValueError if DELIVERY without an address
 
-    return None
+    return None, None, None
 
 
 async def _start_checkout(org_id: UUID, cart_id: UUID, customer: dict, phone: str) -> None:
@@ -384,3 +554,90 @@ async def handle_confirmed_payment(order_id: UUID, reference: str) -> None:
     elif order.get("fulfillment_method") == "PICKUP":
         message += f" You can pick it up at {org.get('pickup_address') or 'our pickup location'} — we'll let you know when it's ready."
     await _send_and_record(order["org_id"], order["customer_id"], customer["phone_number"], message)
+
+
+# ── Post-order feedback ─────────────────────────────────────────
+# Triggered from dashboard.py the moment a merchant marks an order
+# COMPLETED — see migrations/0005_order_feedback.sql. Mirrors the
+# Gigabundle screenshot this whole feature was modelled on: a star-rating
+# prompt, a 5-star tap invites a public review, anything lower asks what
+# went wrong and quietly alerts the manager instead of asking in public.
+
+_FEEDBACK_ISSUE_CATEGORIES = ["Food quality", "Late delivery", "Missing item", "Wrong order", "Customer service", "Other"]
+
+
+async def send_feedback_prompt(order_id: UUID) -> None:
+    if await orders.has_feedback(order_id):
+        return  # already rated — a merchant re-toggling READY<->COMPLETED shouldn't re-prompt
+
+    order = await orders.get_cart_detail(order_id)
+    if not order or not order.get("id"):
+        await log.warn("FEEDBACK_PROMPT_UNKNOWN_ORDER", metadata={"order_id": str(order_id)})
+        return
+
+    db = await get_supabase()
+    customer = (
+        await db.table("customers").select("id, phone_number, name").eq("id", order["customer_id"]).single().execute()
+    ).data
+    if not customer:
+        return
+    org = await _get_org_id()
+
+    body = f"How was your order from {org['name']}?"
+    buttons = [
+        {"type": "reply", "displayText": "★★★★★ Excellent", "id": f"rating:{order_id}:5"},
+        {"type": "reply", "displayText": "★★★ Okay", "id": f"rating:{order_id}:3"},
+        {"type": "reply", "displayText": "★ Poor", "id": f"rating:{order_id}:1"},
+    ]
+    await whatsapp.send_buttons(customer["phone_number"], "We'd love your feedback!", body, buttons)
+    await _record_bot_message(order["org_id"], customer["id"], body)
+
+
+async def _handle_feedback_rating(org_id: UUID, customer: dict, phone: str, button_id: str) -> None:
+    """button_id: 'rating:<order_id>:<5|3|1>' — see send_feedback_prompt."""
+    try:
+        _, order_id_str, rating_str = button_id.split(":", 2)
+        order_id, rating = UUID(order_id_str), int(rating_str)
+    except (ValueError, TypeError):
+        await log.warn("MALFORMED_FEEDBACK_RATING_ID", metadata={"button_id": button_id})
+        return
+
+    if await orders.has_feedback(order_id):
+        await whatsapp.send_message(phone, "Thanks — we've already got your rating for that order!")
+        return
+
+    await orders.save_feedback_rating(org_id, order_id, customer["id"], rating)
+
+    if rating >= 5:
+        body = "Glad you enjoyed it! Would you mind leaving us a Google review?"
+        if settings.google_review_url:
+            body += f"\n{settings.google_review_url}"
+        await _send_and_record(org_id, customer["id"], phone, body)
+        return
+
+    # Anything below 5 stars: ask what went wrong rather than pushing a public review,
+    # and let the manager know right away — a category follows up if the customer
+    # answers, but she shouldn't have to wait on that to hear a rating came in low.
+    body = "Sorry the experience wasn't good. What went wrong?"
+    rows = [{"title": c, "rowId": f"issue:{order_id}:{c}"} for c in _FEEDBACK_ISSUE_CATEGORIES]
+    await whatsapp.send_list(phone, "What went wrong?", body, "Select a reason", [{"title": "Reasons", "rows": rows}])
+    await _record_bot_message(org_id, customer["id"], body)
+
+    await notifications.notify_poor_feedback(order_id, customer, rating, category=None)
+
+
+async def _handle_feedback_issue(org_id: UUID, customer: dict, phone: str, button_id: str) -> None:
+    """button_id: 'issue:<order_id>:<category>' — see _handle_feedback_rating."""
+    try:
+        _, order_id_str, category = button_id.split(":", 2)
+        order_id = UUID(order_id_str)
+    except (ValueError, TypeError):
+        await log.warn("MALFORMED_FEEDBACK_ISSUE_ID", metadata={"button_id": button_id})
+        return
+
+    await orders.save_feedback_issue(order_id, category)
+    await _send_and_record(org_id, customer["id"], phone, "Thanks for letting us know — we'll follow up on this.")
+
+    feedback = await orders.get_feedback(order_id)
+    rating = feedback["rating"] if feedback else 1
+    await notifications.notify_poor_feedback(order_id, customer, rating, category)

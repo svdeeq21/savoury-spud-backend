@@ -12,6 +12,7 @@
 
 import json
 import logging
+from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Request, BackgroundTasks, Depends, HTTPException
 
@@ -27,20 +28,58 @@ _l = logging.getLogger("savoury-spud")
 HANDLED_EVENTS = {"messages.upsert", "MESSAGES_UPSERT", "messages_upsert"}
 
 
-def _extract_phone_and_text(payload: WAWebhookPayload) -> tuple[str, str, bool]:
-    """Returns (phone_number, message_text, is_group_or_unusable)."""
+def _extract_interactive_reply(message: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Returns (raw_id, display_text) for a tap on a list row or reply button,
+    or (None, None) if this message isn't one of those. Covers both the
+    modern Baileys shape (listResponseMessage / buttonsResponseMessage)
+    and the older templateButtonReplyMessage some versions still emit.
+
+    raw_id is whatever the sender put in rowId/buttonId/id when the
+    interactive message was sent out (see whatsapp.send_list/send_buttons)
+    — for ordinary menu/modifier taps that's just the option's own name,
+    for a feedback prompt it's a structured "rating:..."/"issue:..." string.
+    display_text is what the customer would have typed if this had been a
+    normal message, and is what falls through to the ordering LLM unchanged
+    for anything that isn't a structured id.
+    """
+    list_reply = (message.get("listResponseMessage") or {}).get("singleSelectReply") or {}
+    if list_reply.get("selectedRowId"):
+        title = (message.get("listResponseMessage") or {}).get("title") or list_reply.get("selectedRowId")
+        return list_reply["selectedRowId"], title
+
+    buttons_reply = message.get("buttonsResponseMessage") or {}
+    if buttons_reply.get("selectedButtonId"):
+        title = buttons_reply.get("selectedDisplayText") or buttons_reply["selectedButtonId"]
+        return buttons_reply["selectedButtonId"], title
+
+    template_reply = message.get("templateButtonReplyMessage") or {}
+    if template_reply.get("selectedId"):
+        title = template_reply.get("selectedDisplayText") or template_reply["selectedId"]
+        return template_reply["selectedId"], title
+
+    return None, None
+
+
+def _extract_phone_and_text(payload: WAWebhookPayload) -> tuple[str, str, Optional[str], bool]:
+    """Returns (phone_number, message_text, interactive_id, is_group_or_unusable)."""
     wa_data = payload.data
     remote_jid = (wa_data.key or {}).get("remoteJid", "")
 
     if "@g.us" in remote_jid:
-        return "", "", True  # group chat — not something this bot handles
+        return "", "", None, True  # group chat — not something this bot handles
 
     phone_number = remote_jid.replace("@lid", "").replace("@s.whatsapp.net", "").lstrip("+")
+
+    interactive_id, interactive_text = _extract_interactive_reply(wa_data.message or {})
+    if interactive_text is not None:
+        return phone_number, interactive_text, interactive_id, (not phone_number)
+
     message_text = (
         (wa_data.message.get("conversation") or wa_data.message.get("extendedTextMessage", {}).get("text") or "")
         if wa_data.message else ""
     )
-    return phone_number, message_text, (not phone_number or not message_text)
+    return phone_number, message_text, None, (not phone_number or not message_text)
 
 
 @router.post("/whatsapp")
@@ -61,12 +100,12 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks, raw_bo
     if payload.data.key.get("fromMe"):
         return {"status": "ignored", "reason": "own_message"}  # don't let the bot reply to itself
 
-    phone, text, unusable = _extract_phone_and_text(payload)
+    phone, text, interactive_id, unusable = _extract_phone_and_text(payload)
     if unusable:
         return {"status": "ignored", "reason": "no_usable_text_or_group_chat"}
 
     wa_message_id = payload.data.key.get("id")
-    background.add_task(handle_incoming_whatsapp_message, phone, text, wa_message_id, payload.data.pushName)
+    background.add_task(handle_incoming_whatsapp_message, phone, text, wa_message_id, payload.data.pushName, interactive_id)
 
     return {"status": "queued"}
 

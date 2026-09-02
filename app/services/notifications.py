@@ -1,5 +1,7 @@
 # savoury-spud-backend/app/services/notifications.py
 
+from typing import Optional
+
 from app.core.config import get_settings
 from app.services import whatsapp
 from app.utils.logger import log
@@ -37,3 +39,28 @@ async def notify_new_paid_order(order: dict, customer: dict) -> None:
             await whatsapp.send_admin_alert(number, text)
         except Exception as e:
             await log.error("ADMIN_ALERT_FAILED", ref_type="order", ref_id=order.get("id"), metadata={"error": str(e)[:200]})
+
+
+async def notify_poor_feedback(order_id, customer: dict, rating: int, category: Optional[str]) -> None:
+    """A 1- or 3-star rating never goes straight to a public review request (see
+    message_pipeline.send_feedback_prompt) — instead the manager gets this alert
+    so she can follow up directly, same channel as a new-order notification."""
+    if not settings.admin_number_list:
+        await log.warn("NO_ADMIN_NUMBER_CONFIGURED", ref_type="order", ref_id=order_id)
+        return
+
+    stars = "★" * (rating // 2 + 1) if rating < 5 else "★★★★★"  # 1->★, 3->★★, 5 never reaches here
+    text = (
+        f"⚠️ Low rating on order {order_id}\n"
+        f"{customer.get('name') or customer.get('phone_number')} rated {stars} ({rating}/5)"
+    )
+    if category:
+        text += f"\nReason given: {category}"
+    else:
+        text += "\n(No reason given yet.)"
+
+    for number in settings.admin_number_list:
+        try:
+            await whatsapp.send_admin_alert(number, text)
+        except Exception as e:
+            await log.error("ADMIN_ALERT_FAILED", ref_type="order", ref_id=order_id, metadata={"error": str(e)[:200]})
