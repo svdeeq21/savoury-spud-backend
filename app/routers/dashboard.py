@@ -179,3 +179,54 @@ async def list_customers(page: int = Query(1, ge=1), limit: int = Query(50, ge=1
     )
     count_result = await db.table("customers").select("id", count="exact").eq("org_id", str(org_id)).execute()
     return {"customers": result.data or [], "total": count_result.count or 0, "page": page, "limit": limit}
+
+
+# ── Conversations ───────────────────────────────────────────────
+
+@router.get("/conversations")
+async def list_conversations(
+    phone: Optional[str] = None,
+    limit: int = Query(300, ge=1, le=2000),
+    _: str = Depends(require_admin_key),
+):
+    """
+    Raw chat transcript for reviewing real conversations — every message
+    both bot and customer sent goes through conversation_messages (see
+    message_pipeline._send_and_record / _claim_message), so this is a
+    complete, ordered log, not a reconstruction.
+
+    Filter by phone (any format — normalized before lookup) to see one
+    customer's full history in order. Omit it to get everyone's recent
+    messages interleaved by time, most useful as a quick activity scan
+    rather than for reading a single conversation start to finish.
+    """
+    org_id = await _org_id()
+    db = await get_supabase()
+
+    customer_id = None
+    if phone:
+        normalized = orders.normalize_phone(phone)
+        customer_result = (
+            await db.table("customers")
+            .select("id, name, phone_number")
+            .eq("org_id", str(org_id))
+            .eq("phone_number", normalized)
+            .execute()
+        )
+        if not customer_result.data:
+            raise HTTPException(status_code=404, detail=f"No customer found with phone number {normalized}")
+        customer_id = customer_result.data[0]["id"]
+
+    query = (
+        db.table("conversation_messages")
+        .select("sender, content, created_at, customer_id")
+        .eq("org_id", str(org_id))
+        .order("created_at", desc=False)
+        .limit(limit)
+    )
+    if customer_id:
+        query = query.eq("customer_id", customer_id)
+
+    result = await query.execute()
+    messages = result.data or []
+    return {"messages": messages, "count": len(messages)}

@@ -9,6 +9,69 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Fixes from a real transcript review
+
+An outside review of live conversation logs (mostly accurate, worth taking
+seriously) surfaced real bugs. Two were traced to their actual root cause
+rather than just patched at the symptom:
+
+- **"Adding that to your cart" followed by "Cannot check out an empty
+  cart" hours later.** Traced with the actual timestamps: `set_fulfillment_details`
+  never bumped `orders.updated_at`, so the cart-staleness clock
+  (`CART_STALE_AFTER_HOURS`) kept counting from the last *pricing*
+  mutation instead of the last real interaction. A customer who took a
+  couple of hours to answer "pickup or delivery?" could have their cart
+  silently expire mid-conversation. Fixed — `set_fulfillment_details` now
+  bumps `updated_at` like every other cart mutation.
+- **"Okay" → "Enjoy your order!" with no payment having happened.** Worse
+  than it looks: once checkout starts, the order leaves `CART` status and
+  becomes invisible to `get_or_create_open_cart` — the next message
+  silently spun up a brand-new *empty* cart, and the LLM, seeing nothing
+  in it, freely improvised a close with zero actual awareness a payment
+  was in flight. Fixed with a hard, LLM-free gate: `message_pipeline`
+  checks for an in-flight `PAYMENT_PENDING` order *before* touching the
+  ordering flow at all (`orders.get_pending_payment_order`). While one
+  exists, the customer gets a deterministic reminder with the real payment
+  link (now stored — `payments.authorization_url`, migration `0005`) or
+  can cancel it explicitly; nothing about payment state is ever left to
+  the LLM's judgment.
+- **A silently-failed `add_product` could still say "Adding that to your
+  cart now!"** If the LLM's product name didn't resolve, this used to log
+  a warning and say nothing — leaving the LLM's optimistic reply
+  unchallenged even though nothing was added. Now returns an honest
+  override instead.
+- **WhatsApp doesn't render standard Markdown** — `**bold**` just shows as
+  literal asterisks. `app/utils/whatsapp_format.py` normalizes every
+  outbound message at the universal send boundary in `whatsapp.py`
+  (`**bold**` → `*bold*`, headers stripped to bold, markdown links
+  flattened to plain URLs), and the prompt is told to use WhatsApp's own
+  syntax directly rather than relying on cleanup alone.
+- **The identical "outside operating hours" message got repeated
+  verbatim on every single message** once triggered once. Now suppressed
+  if the last thing sent was that exact line (`_is_duplicate_bot_message`).
+- Two prompt rules added directly from the transcripts: never confirm
+  with a bare "Got it!" — always restate what actually happened; never
+  guess on ambiguity that could change what's charged or how something's
+  fulfilled ("no delivery please" — ask, don't assume).
+
+### What's genuinely good direction from that review, not built today
+
+The reviewer's broader architecture — explicit conversation states, an
+intent router (`ORDER_STATUS`, `COMPLAINT`, `HUMAN_SUPPORT`, etc. instead
+of everything defaulting to "sell them a box"), a staff-driven order
+lifecycle dashboard with automatic customer notifications, and a
+regression suite built from real transcripts — is the right long-term
+shape and worth building toward. It's not started here because each of
+those is a genuine multi-day feature, not a bug fix, and the transaction-
+correctness issues above were both more dangerous and more urgent. A
+couple of the reviewer's specific diagnoses didn't quite match this
+codebase once traced (e.g. "state isn't authoritative" was actually one
+specific missing `updated_at` bump, and the restaurant-config-separated-
+from-code point is already mostly true — organizations/products/modifiers
+are schema-driven per org, not hardcoded) — worth knowing the difference
+between "this exact thing is broken" and "this is good direction to grow
+into" before committing real time to either.
+
 ## Interactive messages (buttons/lists) — added, not yet wired into ordering
 
 Native WhatsApp buttons and list menus (`app/services/whatsapp.py`:
@@ -209,18 +272,19 @@ Live testing on Render surfaced three real issues, all fixed here:
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 86 passed, no external services required
+pytest -q              # 106 passed, no external services required
 uvicorn main:app --reload
 ```
 
 Run the migrations in order against a fresh Supabase project:
 `0001_ordering_schema.sql` → `0002_fulfillment_and_selection_limits.sql` →
-`0003_seed_savoury_spud_catalog.sql` → `0004_draft_cart_item.sql`.
+`0003_seed_savoury_spud_catalog.sql` → `0004_draft_cart_item.sql` →
+`0005_payment_link_and_cart_updated_at.sql`.
 
-**Already live?** Only `0004_draft_cart_item.sql` needs to be run against
-the existing database — it's a single additive column
-(`alter table orders add column draft_item jsonb`), safe to run without
-touching anything already in there.
+**Already live?** Run `0004_draft_cart_item.sql` and
+`0005_payment_link_and_cart_updated_at.sql` against the existing
+database — both are single additive columns, safe to run without
+touching anything already there.
 
 ## What you need to supply before this can take a real order
 

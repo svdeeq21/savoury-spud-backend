@@ -15,6 +15,7 @@
 # instead of being dropped.
 
 from __future__ import annotations
+import re
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -104,6 +105,12 @@ async def _get_recent_history(customer_id: UUID, limit: int) -> list[dict]:
     return list(reversed(result.data or []))
 
 
+def _is_duplicate_bot_message(recent_history: list[dict], candidate_text: str) -> bool:
+    """True if the most recent message was this exact bot message already — used to stop
+    the closed-hours notice (or anything else) from being repeated verbatim every single turn."""
+    return bool(recent_history) and recent_history[-1].get("sender") == "BOT" and recent_history[-1].get("content") == candidate_text
+
+
 def _is_admin_number(phone: str) -> bool:
     normalized = normalize_phone(phone)
     return any(normalize_phone(n) == normalized for n in settings.admin_number_list)
@@ -147,6 +154,35 @@ async def _handle_admin_message(org_id: UUID, phone: str, text: str) -> None:
     await whatsapp.send_message(phone, reply)
 
 
+_PENDING_PAYMENT_CANCEL_PATTERN = re.compile(r"\b(cancel|start over|never\s*mind|nevermind|forget it|undo)\b", re.IGNORECASE)
+
+
+async def _handle_pending_payment_message(org_id: UUID, customer_id: UUID, phone: str, pending_order: dict, text: str) -> None:
+    """
+    Deterministic, LLM-free handling for anything sent while a checkout is
+    already in flight. This is the fix for the most dangerous bug found in
+    a real transcript: once an order left CART status, the conversation had
+    zero awareness a payment was pending, and the LLM — seeing a blank new
+    cart — freely improvised a close ("Enjoy your order!") with no actual
+    payment having happened. Nothing here is left to the LLM's judgment on
+    purpose; money is deterministic territory.
+    """
+    if _PENDING_PAYMENT_CANCEL_PATTERN.search(text):
+        await orders.cancel_pending_order(pending_order["id"])
+        await _send_and_record(
+            org_id, customer_id, phone,
+            "No problem — I've cancelled that checkout. Message me anytime you're ready to start a new order.",
+        )
+        return
+
+    message = f"You've got a payment in progress for ₦{pending_order['subtotal']:,.2f}."
+    payment_row_url = pending_order.get("_authorization_url")  # attached by the caller, see below
+    if payment_row_url:
+        message += f" Here's the link again:\n{payment_row_url}"
+    message += "\n\nI'll confirm automatically the moment it goes through — no need to tell me. Say \"cancel\" if you'd rather start over instead."
+    await _send_and_record(org_id, customer_id, phone, message)
+
+
 async def _handle_customer_message(
     org_id: UUID,
     business_name: str,
@@ -161,13 +197,23 @@ async def _handle_customer_message(
     if is_new:
         await _send_and_record(org_id, customer_id, phone, _WELCOME_MESSAGE_TEMPLATE.format(business_name=business_name))
 
+    # Hard gate, checked before anything else: a checkout already in flight is never
+    # allowed to fall through to the ordering LLM with a blank cart.
+    pending_order = await orders.get_pending_payment_order(org_id, customer_id)
+    if pending_order:
+        pending_order["_authorization_url"] = await orders.get_pending_payment_link(pending_order["id"])
+        await _handle_pending_payment_message(org_id, customer_id, phone, pending_order, text)
+        return
+
     now_local = availability.to_business_time(datetime.now(timezone.utc), settings.business_utc_offset_hours)
     availability_row = await availability_store.get_availability_settings(org_id)
     hours_row = await availability_store.get_operating_hours_for_day(org_id, now_local.weekday())
     is_open, closed_reason = availability.resolve_business_open(availability_row, hours_row, now_local)
 
     if not is_open:
-        await _send_and_record(org_id, customer_id, phone, closed_reason)
+        recent = await _get_recent_history(customer_id, 1)
+        if not _is_duplicate_bot_message(recent, closed_reason):
+            await _send_and_record(org_id, customer_id, phone, closed_reason)
         return
 
     cart = await orders.get_or_create_open_cart(org_id, customer_id, stale_after_hours=settings.cart_stale_after_hours)
@@ -287,10 +333,13 @@ async def _apply_action(cart_id: UUID, catalog_rows: list[dict], action: dict) -
     if fn == "add_product":
         product = _find_product_by_name(catalog_rows, action.get("product_name", ""))
         if product is None:
-            # The LLM was instructed never to invent items, but this is the deterministic
-            # backstop if it does anyway — silently drop rather than write garbage to the cart.
+            # Confirmed root cause of a real bug: this used to silently no-op here,
+            # meaning the LLM's own optimistic reply ("Adding that to your cart now!")
+            # would reach the customer even though NOTHING was actually added — exactly
+            # the "bot claims success the backend never confirmed" failure mode. Now it
+            # overrides with an honest message instead of staying silent.
             await log.warn("LLM_REFERENCED_UNKNOWN_PRODUCT", metadata={"name": action.get("product_name")})
-            return None
+            return f"Sorry, I couldn't match \"{action.get('product_name') or 'that'}\" to anything on our menu — could you tell me again what you'd like?"
         modifiers = _resolve_modifiers_by_name(product, action.get("modifier_names", []) or [])
         quantity = max(1, int(action.get("quantity", 1) or 1))
         result = await orders.update_draft_item(cart_id, product, quantity, modifiers)
@@ -353,7 +402,7 @@ async def _start_checkout(org_id: UUID, cart_id: UUID, customer: dict, phone: st
             customer_email="",
             customer_phone=phone,
         )
-        await orders.record_pending_payment(order["id"], payment["reference"], amount_to_charge)
+        await orders.record_pending_payment(order["id"], payment["reference"], amount_to_charge, payment["authorization_url"])
     except Exception as e:
         await log.error("CHECKOUT_INIT_FAILED", ref_type="order", ref_id=order["id"], metadata={"error": str(e)[:200]})
         await _send_and_record(org_id, customer_id, phone, "Sorry, I couldn't start checkout right now — please try again in a moment.")

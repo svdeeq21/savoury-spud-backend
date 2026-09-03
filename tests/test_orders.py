@@ -328,6 +328,74 @@ async def test_metrics_separate_food_revenue_from_delivery_fees(patched_db):
     assert metrics["delivery_fees_recorded"] == 1500.0
 
 
+# ── Payment-pending gate (the fix for the "Enjoy your order!" bug) ──
+
+async def test_set_fulfillment_details_bumps_updated_at(patched_db):
+    """
+    Confirmed bug from a real transcript: this used to leave updated_at untouched,
+    so the cart-staleness clock kept counting from the last pricing mutation instead
+    of the last real interaction, silently expiring carts mid-checkout.
+    """
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    original_updated_at = cart.get("updated_at")
+
+    updated = await orders_module.set_fulfillment_details(cart["id"], method="PICKUP")
+
+    assert updated.get("updated_at") is not None
+    assert updated.get("updated_at") != original_updated_at
+
+
+async def test_get_pending_payment_order_finds_the_right_order(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    await orders_module.add_product(cart["id"], {"id": "prod-1", "name": "Chapman", "base_price": 2500}, 1, [])
+    await orders_module.set_fulfillment_details(cart["id"], method="PICKUP")
+    order = await orders_module.start_checkout(cart["id"])
+
+    pending = await orders_module.get_pending_payment_order(org_id, customer_id)
+    assert pending is not None
+    assert pending["id"] == order["id"]
+    assert pending["status"] == "PAYMENT_PENDING"
+
+
+async def test_get_pending_payment_order_returns_none_when_no_checkout_in_flight(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    await orders_module.get_or_create_open_cart(org_id, customer_id)  # just a cart, never checked out
+
+    pending = await orders_module.get_pending_payment_order(org_id, customer_id)
+    assert pending is None
+
+
+async def test_cancel_pending_order_only_cancels_from_payment_pending(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    await orders_module.add_product(cart["id"], {"id": "prod-1", "name": "Chapman", "base_price": 2500}, 1, [])
+    await orders_module.set_fulfillment_details(cart["id"], method="PICKUP")
+    order = await orders_module.start_checkout(cart["id"])
+
+    cancelled = await orders_module.cancel_pending_order(order["id"])
+    assert cancelled["status"] == "CANCELLED"
+
+    # And the customer can now start a fresh cart — the cancelled one is out of the way.
+    new_cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    assert new_cart["id"] != order["id"]
+    assert new_cart["status"] == "CART"
+
+
+async def test_record_pending_payment_stores_authorization_url(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    await orders_module.add_product(cart["id"], {"id": "prod-1", "name": "Chapman", "base_price": 2500}, 1, [])
+    await orders_module.set_fulfillment_details(cart["id"], method="PICKUP")
+    order = await orders_module.start_checkout(cart["id"])
+
+    await orders_module.record_pending_payment(order["id"], "ref_xyz", 2500, "https://checkout.paystack.com/xyz")
+
+    link = await orders_module.get_pending_payment_link(order["id"])
+    assert link == "https://checkout.paystack.com/xyz"
+
+
 # ── Cart staleness (returning after a long gap starts fresh, not resuming an old cart) ──
 
 async def test_get_or_create_open_cart_reuses_recent_cart(patched_db):

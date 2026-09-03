@@ -12,6 +12,7 @@ import httpx
 from app.core.config import get_settings
 from app.utils.logger import log
 from app.utils.retry import with_retry
+from app.utils.whatsapp_format import to_whatsapp_markdown
 
 settings = get_settings()
 
@@ -32,6 +33,9 @@ def _format_phone(phone: str) -> str:
 
 @with_retry(max_attempts=3, base_delay=2.0)
 async def _send_text_wa_call(phone_number: str, text: str, delay: float) -> None:
+    # Single choke point for every plain-text send — normalized here once rather than
+    # trusting every call site (and every future one) to remember to sanitize itself.
+    text = to_whatsapp_markdown(text)
     url = f"{settings.evolution_api_url}/message/sendText/{settings.evolution_instance_name}"
     payload = {
         "number": _format_phone(phone_number),

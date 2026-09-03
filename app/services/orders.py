@@ -394,6 +394,12 @@ async def set_fulfillment_details(
         # Pickup has no fee to confirm — 0 is correct and final, so mark it confirmed
         # immediately rather than leaving it in the "waiting on a human" state.
         "delivery_fee_confirmed": method == "PICKUP",
+        # Confirmed bug from a real transcript: this used to omit updated_at, so the
+        # cart-staleness clock (get_or_create_open_cart) kept counting from whenever an
+        # item was last added/priced, NOT from this — the actual last real interaction.
+        # A customer who took a couple of hours to answer "pickup or delivery?" could
+        # have their cart silently expire mid-checkout with no warning.
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if method == "DELIVERY":
         payload.update({
@@ -447,7 +453,7 @@ async def start_checkout(order_id: UUID) -> dict:
     if order["status"] != "CART":
         raise ValueError(f"Cannot start checkout on an order in status {order['status']!r}")
     if not order.get("subtotal") or float(order["subtotal"]) <= 0:
-        raise ValueError("Cannot check out an empty cart")
+        raise ValueError("Your cart's empty right now — what would you like to order?")
     if not order.get("fulfillment_method"):
         raise ValueError("Would you like pickup or delivery for this order?")
 
@@ -548,12 +554,70 @@ async def expire_stale_pending_orders(org_id: UUID, older_than_minutes: int = 30
     return len(stale)
 
 
-async def record_pending_payment(order_id: UUID, reference: str, amount) -> dict:
+async def get_pending_payment_link(order_id: UUID) -> Optional[str]:
+    """Looks up the authorization_url stored when checkout started — lets a reminder resend the actual working link."""
+    db = await get_supabase()
+    result = (
+        await db.table("payments")
+        .select("authorization_url")
+        .eq("order_id", str(order_id))
+        .eq("status", "pending")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0].get("authorization_url") if rows else None
+
+
+async def get_pending_payment_order(org_id: UUID, customer_id: UUID) -> Optional[dict]:
+    """
+    The fix for a real, dangerous bug: once checkout starts, the order
+    leaves CART status and get_or_create_open_cart can no longer see it —
+    the next message would silently spin up a brand-new EMPTY cart, and
+    the ordering LLM, seeing nothing in it, would freely improvise a close
+    ("Enjoy your order!") with zero actual awareness a payment was ever in
+    flight. message_pipeline checks this BEFORE touching the ordering flow
+    at all, so an in-flight checkout is never invisible to the conversation.
+    """
+    db = await get_supabase()
+    result = (
+        await db.table("orders")
+        .select("*")
+        .eq("customer_id", str(customer_id))
+        .eq("status", "PAYMENT_PENDING")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+async def cancel_pending_order(order_id: UUID) -> Optional[dict]:
+    """Customer-initiated cancellation of their own in-flight checkout — separate from
+    update_status's staff-driven transitions, since PAYMENT_PENDING -> CANCELLED here
+    means 'I changed my mind before paying', not a kitchen/fulfillment decision."""
+    db = await get_supabase()
+    updated = (
+        await db.table("orders")
+        .update({"status": "CANCELLED", "updated_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", str(order_id))
+        .eq("status", "PAYMENT_PENDING")
+        .execute()
+    )
+    return updated.data[0] if updated.data else None
+
+
+async def record_pending_payment(order_id: UUID, reference: str, amount, authorization_url: str = "") -> dict:
     """Called right after paystack.initialize_transaction succeeds — creates the payments row the webhook will later look up by reference."""
     db = await get_supabase()
     result = (
         await db.table("payments")
-        .insert({"order_id": str(order_id), "reference": reference, "amount": float(amount), "status": "pending"})
+        .insert({
+            "order_id": str(order_id), "reference": reference,
+            "amount": float(amount), "status": "pending",
+            "authorization_url": authorization_url,
+        })
         .execute()
     )
     return result.data[0]
