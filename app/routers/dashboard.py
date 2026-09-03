@@ -18,7 +18,8 @@ from app.models.schemas import (
     ProductIn, ProductPatch, ModifierPatch, AvailabilityPatch,
     OperatingHoursPatch, OrderStatusPatch, DeliveryFeeIn,
 )
-from app.services import orders, catalog, availability, availability_store
+from app.services import orders, catalog, availability, availability_store, paystack as paystack_service
+from app.services.message_pipeline import handle_confirmed_payment
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 settings = get_settings()
@@ -73,6 +74,43 @@ async def set_order_delivery_fee(order_id: UUID, patch: DeliveryFeeIn, _: str = 
     however she and the customer agree, outside Paystack.
     """
     return await orders.set_delivery_fee(order_id, patch.delivery_fee)
+
+
+@router.post("/orders/{order_id}/verify-payment")
+async def verify_payment_manually(order_id: UUID, _: str = Depends(require_admin_key)):
+    """
+    Manual reconciliation for when the Paystack webhook never arrives — a
+    misconfigured or unset webhook URL, a delivery failure, anything.
+    Checks Paystack directly via the Verify Transaction API and, if the
+    payment genuinely succeeded, runs the exact same confirmation flow the
+    webhook would have (customer notification, merchant alert, PAID
+    status). Safe to call speculatively: idempotent if already confirmed,
+    and refuses to act on anything that isn't actually PAYMENT_PENDING or
+    doesn't verify as successful.
+    """
+    order = await orders.get_cart_detail(order_id)
+    if not order or not order.get("id"):
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["status"] != "PAYMENT_PENDING":
+        return {"status": order["status"], "message": "Nothing to reconcile — this order isn't awaiting payment."}
+
+    reference = f"spud_{order_id}"
+    try:
+        verified = await paystack_service.verify_transaction(reference)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach Paystack to verify: {str(e)[:200]}")
+
+    if verified.get("status") != "success":
+        return {"status": "not_paid", "paystack_status": verified.get("status"), "message": "Paystack doesn't show this as a successful payment."}
+
+    if not paystack_service.amount_matches(order["subtotal"], verified.get("amount", 0)):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Amount mismatch — order expects ₦{order['subtotal']}, Paystack shows {verified.get('amount')} kobo. Not confirming automatically.",
+        )
+
+    await handle_confirmed_payment(order_id, reference)
+    return {"status": "confirmed", "order_id": str(order_id), "reference": reference}
 
 
 @router.get("/metrics")
