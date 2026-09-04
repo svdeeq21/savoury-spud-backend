@@ -280,7 +280,21 @@ async def _handle_customer_message(
         # since the LLM's reply was written without knowing the commit would fail.
         await _send_and_record(org_id, customer_id, phone, override_message)
     else:
-        await _send_and_record(org_id, customer_id, phone, llm_result.get("reply", "Got it."))
+        # This is the path with no authoritative override — either a committed
+        # add_product (fully specified in one message, so _apply_action returned
+        # None and let the LLM's own "added!" reply stand) or a pure conversational
+        # turn with zero actions. Both are exactly the cases where real transcripts
+        # showed the model dropping rule 9 (no next step, just "Got it!" or
+        # "Adding your Large box..."). Rather than trust the model's discipline on
+        # every turn, guarantee it here: if the reply doesn't already read as a
+        # question (the model's own next-step framing, when it does include one),
+        # append the deterministic next-step line computed from the post-mutation
+        # cart — never the LLM's improvisation.
+        reply_text = (llm_result.get("reply") or "").strip() or "Got it."
+        if not reply_text.rstrip().endswith("?"):
+            updated_cart = await orders.get_cart_detail(cart["id"])
+            reply_text = f"{reply_text} {_deterministic_next_step(updated_cart)}"
+        await _send_and_record(org_id, customer_id, phone, reply_text)
 
 
 def _find_product_by_name(catalog_rows: list[dict], name: str) -> Optional[dict]:
@@ -315,6 +329,28 @@ def _safe_uuid(value) -> Optional[UUID]:
         return UUID(str(value))
     except (ValueError, TypeError):
         return None
+
+
+def _deterministic_next_step(cart_detail: dict) -> str:
+    """
+    The one canonical "what can you do now" line, computed from real cart
+    state — never the LLM's improvisation. This exists because rule 9 in
+    the ordering prompt (always end with a clear next step) turned out to
+    be a request the model follows inconsistently, not a guarantee: real
+    transcripts show fully-committed add_product turns and plain
+    conversational turns (see the `else` branch in _handle_customer_message)
+    landing the LLM's raw "reply" on the customer with no next step at all
+    ("Adding your Large box with Plantain, Crispy Chicken..." — and
+    nothing else). _format_incomplete_draft_message already solved this
+    for incomplete adds by generating the message from data instead of
+    trusting the model; this is the same fix applied to the two paths that
+    still didn't have it.
+    """
+    if not cart_detail.get("items"):
+        return "What would you like to order — build a box, or add a drink?"
+    if not cart_detail.get("fulfillment_method"):
+        return "Want to add anything else, or are you ready to checkout? Also, will this be pickup or delivery?"
+    return "Want to add anything else, or are you ready to checkout?"
 
 
 def _format_incomplete_draft_message(product_name: str, result: dict) -> str:
