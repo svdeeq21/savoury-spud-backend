@@ -9,6 +9,43 @@ Isolated on purpose: separate repo, separate Supabase project, nothing here
 imports from or writes to the real-estate codebase. Extract reusable pieces
 into Hooze proper only once this has survived contact with real orders.
 
+## Confirmed working: the payment webhook
+
+A real transcript shows `handle_confirmed_payment` firing automatically —
+"Payment received — thank you!" sent with no manual reconciliation needed.
+The `/dashboard/orders/{id}/verify-payment` endpoint from the earlier fix
+remains as a safety net for any future webhook delivery failure, but the
+root cause (missing webhook URL in the Paystack dashboard) is fixed.
+
+## Conversational UX improvements (from an external review + real transcripts)
+
+An external spec on conversational completeness was mostly about prompt
+quality, not architecture — validated against real transcripts before
+implementing anything:
+
+- **"cancel it and create the sam order again"** was a genuine gap: the
+  payment-pending gate correctly cancelled the old checkout but then made
+  the customer retype their entire order from scratch. Fixed narrowly and
+  deterministically — `orders.duplicate_order_items()` copies the
+  cancelled order's items, modifiers, and fulfillment details into a fresh
+  cart, triggered only by the specific "cancel + same/again" phrasing
+  (`_REPEAT_ORDER_PATTERN` in `message_pipeline.py`). This is deliberately
+  **not** a general "modify order while payment is pending" feature — the
+  payment-pending gate stays exactly as strict as before for anything
+  else; only this one unambiguous, code-driven case was added.
+- **Prompt rules 9–11** (`ordering_llm.py`): every committed action must
+  now include a concrete next step ("Want a drink with that, or ready to
+  check out?"), not just an acknowledgment — a bare "Added the Chapman."
+  no longer satisfies the rule. Ambiguous short confirmations ("yes") are
+  only accepted when the preceding question had exactly one sensible
+  reading. And the model is told explicitly to sound like a person who
+  works there, not a formal system — no "your request has been
+  processed" phrasing.
+- Multi-intent extraction in one message, not repeating already-answered
+  questions, and using the cart as context were **already working**
+  correctly per the transcripts (verified, not assumed) — no changes
+  needed there.
+
 ## Fixes from a real transcript review
 
 An outside review of live conversation logs (mostly accurate, worth taking
@@ -272,7 +309,7 @@ Live testing on Render surfaced three real issues, all fixed here:
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env   # fill in real values — see below
-pytest -q              # 106 passed, no external services required
+pytest -q              # 112 passed, no external services required
 uvicorn main:app --reload
 ```
 

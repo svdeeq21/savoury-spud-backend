@@ -570,6 +570,71 @@ async def get_pending_payment_link(order_id: UUID) -> Optional[str]:
     return rows[0].get("authorization_url") if rows else None
 
 
+async def duplicate_order_items(source_order_id: UUID, dest_order_id: UUID) -> dict:
+    """
+    Copies every line item (with its modifiers) and the fulfillment details
+    from source_order_id into dest_order_id, then recalculates dest's
+    totals. Built specifically for "cancel it and create the same order
+    again" — rebuilding by hand would mean the customer retyping their
+    entire order, which defeats the point of asking for it in the first
+    place. Deliberately code-driven, not LLM-improvised: money and cart
+    contents stay deterministic even for this convenience feature.
+    """
+    db = await get_supabase()
+
+    source_order = (
+        await db.table("orders")
+        .select("fulfillment_method, delivery_address, delivery_area, delivery_landmark, fulfillment_time_preference")
+        .eq("id", str(source_order_id))
+        .single()
+        .execute()
+    ).data or {}
+
+    source_items = (
+        await db.table("order_items").select("*").eq("order_id", str(source_order_id)).execute()
+    ).data or []
+
+    for item in source_items:
+        new_item = (
+            await db.table("order_items")
+            .insert({
+                "order_id": str(dest_order_id),
+                "product_id": item.get("product_id"),
+                "product_name": item["product_name"],
+                "base_price": item["base_price"],
+                "quantity": item["quantity"],
+                "line_total": item["line_total"],
+            })
+            .execute()
+        ).data[0]
+
+        source_mods = (
+            await db.table("order_item_modifiers")
+            .select("modifier_id, modifier_name, price")
+            .eq("order_item_id", item["id"])
+            .execute()
+        ).data or []
+        for m in source_mods:
+            await db.table("order_item_modifiers").insert({
+                "order_item_id": new_item["id"],
+                "modifier_id": m.get("modifier_id"),
+                "modifier_name": m["modifier_name"],
+                "price": m["price"],
+            }).execute()
+
+    if source_order.get("fulfillment_method"):
+        await set_fulfillment_details(
+            dest_order_id,
+            method=source_order["fulfillment_method"],
+            delivery_address=source_order.get("delivery_address"),
+            delivery_area=source_order.get("delivery_area"),
+            delivery_landmark=source_order.get("delivery_landmark"),
+            time_preference=source_order.get("fulfillment_time_preference") or "ASAP",
+        )
+
+    return await recalculate_cart(dest_order_id)
+
+
 async def get_pending_payment_order(org_id: UUID, customer_id: UUID) -> Optional[dict]:
     """
     The fix for a real, dangerous bug: once checkout starts, the order

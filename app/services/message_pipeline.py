@@ -155,6 +155,17 @@ async def _handle_admin_message(org_id: UUID, phone: str, text: str) -> None:
 
 
 _PENDING_PAYMENT_CANCEL_PATTERN = re.compile(r"\b(cancel|start over|never\s*mind|nevermind|forget it|undo)\b", re.IGNORECASE)
+_REPEAT_ORDER_PATTERN = re.compile(r"\b(again|same (order|thing)|repeat (that|it|the order)|do (it|that) again)\b", re.IGNORECASE)
+
+
+def _format_cart_summary(cart_detail: dict) -> str:
+    if not cart_detail.get("items"):
+        return "an empty cart"
+    parts = []
+    for item in cart_detail["items"]:
+        mods = ", ".join(m["modifier_name"] for m in item.get("modifiers", []))
+        parts.append(f"{item['quantity']}x {item['product_name']}" + (f" ({mods})" if mods else ""))
+    return "; ".join(parts)
 
 
 async def _handle_pending_payment_message(org_id: UUID, customer_id: UUID, phone: str, pending_order: dict, text: str) -> None:
@@ -166,9 +177,28 @@ async def _handle_pending_payment_message(org_id: UUID, customer_id: UUID, phone
     cart — freely improvised a close ("Enjoy your order!") with no actual
     payment having happened. Nothing here is left to the LLM's judgment on
     purpose; money is deterministic territory.
+
+    One deliberately narrow exception, from a real "cancel it and create
+    the same order again" request: recognizing that specific phrasing and
+    rebuilding the exact same cart is still fully code-driven (see
+    orders.duplicate_order_items) — it's a convenience shortcut for an
+    unambiguous request, not the LLM improvising a modification to a
+    payment-pending order, which stays out of scope on purpose.
     """
     if _PENDING_PAYMENT_CANCEL_PATTERN.search(text):
         await orders.cancel_pending_order(pending_order["id"])
+
+        if _REPEAT_ORDER_PATTERN.search(text):
+            new_cart = await orders.get_or_create_open_cart(org_id, customer_id, stale_after_hours=settings.cart_stale_after_hours)
+            cart_detail = await orders.duplicate_order_items(pending_order["id"], new_cart["id"])
+            summary = _format_cart_summary(cart_detail)
+            await _send_and_record(
+                org_id, customer_id, phone,
+                f"Cancelled the old checkout and rebuilt the same order — {summary}. "
+                f"Total: ₦{cart_detail['total']:,.2f}. Ready to check out, or want to change anything first?",
+            )
+            return
+
         await _send_and_record(
             org_id, customer_id, phone,
             "No problem — I've cancelled that checkout. Message me anytime you're ready to start a new order.",

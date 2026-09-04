@@ -558,3 +558,51 @@ async def test_update_draft_item_starting_a_different_product_resets_the_draft(p
     result = await orders_module.update_draft_item(cart["id"], drink, 1, [])
     assert result["committed"] is True  # Chapman has no required groups at all
     assert result["item"]["product_name"] == "Chapman"
+
+
+# ── Duplicate order items ("cancel it and create the same order again") ──
+
+async def test_duplicate_order_items_copies_items_modifiers_and_total(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    source_cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    await orders_module.add_product(
+        source_cart["id"],
+        {"id": "prod-1", "name": "Chapman", "base_price": 2500}, 1, [],
+    )
+    await orders_module.set_fulfillment_details(source_cart["id"], method="PICKUP")
+    source_order = await orders_module.start_checkout(source_cart["id"])
+    await orders_module.cancel_pending_order(source_order["id"])
+
+    dest_cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    result = await orders_module.duplicate_order_items(source_order["id"], dest_cart["id"])
+
+    assert float(result["subtotal"]) == 2500.0
+    assert float(result["total"]) == 2500.0
+    dest_items = [i for i in patched_db.tables["order_items"] if i["order_id"] == dest_cart["id"]]
+    assert len(dest_items) == 1
+    assert dest_items[0]["product_name"] == "Chapman"
+    # Fulfillment carried over too, not just the items
+    dest_order_row = [o for o in patched_db.tables["orders"] if o["id"] == dest_cart["id"]][0]
+    assert dest_order_row["fulfillment_method"] == "PICKUP"
+
+
+async def test_duplicate_order_items_copies_modifiers_too(patched_db):
+    org_id, customer_id = uuid4(), uuid4()
+    source_cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    product = {"id": "prod-1", "name": "Build Your Box", "base_price": 0}
+    modifiers = [
+        {"id": "m-regular", "name": "Regular", "price": 9000},
+        {"id": "m-chicken", "name": "Crispy Chicken", "price": 0},
+    ]
+    await orders_module.add_product(source_cart["id"], product, 1, modifiers)
+
+    dest_cart = await orders_module.get_or_create_open_cart(org_id, customer_id)
+    # Simulate the source cart having gone to checkout and back — duplicate works on any order_id, not just cancelled ones
+    await orders_module.duplicate_order_items(source_cart["id"], dest_cart["id"])
+
+    dest_item = [i for i in patched_db.tables["order_items"] if i["order_id"] == dest_cart["id"]][0]
+    dest_mods = {
+        m["modifier_name"] for m in patched_db.tables["order_item_modifiers"] if m["order_item_id"] == dest_item["id"]
+    }
+    assert dest_mods == {"Regular", "Crispy Chicken"}
+    assert float(dest_item["line_total"]) == 9000.0

@@ -35,3 +35,41 @@ def test_cancel_pattern_matches_common_phrasings():
 def test_cancel_pattern_does_not_match_unrelated_text():
     for phrase in ["has my order been placed?", "when will it arrive", "okay", "thanks"]:
         assert not _PENDING_PAYMENT_CANCEL_PATTERN.search(phrase), f"expected NOT to match: {phrase!r}"
+
+
+def test_repeat_order_pattern_matches_common_phrasings():
+    from app.services.message_pipeline import _REPEAT_ORDER_PATTERN
+    for phrase in [
+        "cancel it and create the sam order again",
+        "cancel and do the same order",
+        "same thing again please",
+        "repeat that order",
+        "just do it again",
+    ]:
+        assert _REPEAT_ORDER_PATTERN.search(phrase), f"expected to match: {phrase!r}"
+
+
+def test_repeat_order_pattern_does_not_match_plain_cancel():
+    from app.services.message_pipeline import _REPEAT_ORDER_PATTERN
+    assert not _REPEAT_ORDER_PATTERN.search("cancel")
+    assert not _REPEAT_ORDER_PATTERN.search("never mind, forget it")
+
+
+def test_format_cart_summary_lists_items_with_modifiers():
+    from app.services.message_pipeline import _format_cart_summary
+    cart_detail = {
+        "items": [
+            {"quantity": 1, "product_name": "Build Your Box", "modifiers": [
+                {"modifier_name": "Large"}, {"modifier_name": "Crispy Chicken"},
+            ]},
+            {"quantity": 2, "product_name": "Chapman", "modifiers": []},
+        ]
+    }
+    summary = _format_cart_summary(cart_detail)
+    assert "1x Build Your Box (Large, Crispy Chicken)" in summary
+    assert "2x Chapman" in summary
+
+
+def test_format_cart_summary_handles_empty_cart():
+    from app.services.message_pipeline import _format_cart_summary
+    assert _format_cart_summary({"items": []}) == "an empty cart"
